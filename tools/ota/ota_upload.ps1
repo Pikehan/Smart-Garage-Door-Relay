@@ -64,7 +64,7 @@ Write-Host "`n[2/3] Uploading firmware to ESP32 (http://${IpAddress}/update)..."
 $uploadSuccess = $false
 try {
     $uri = "http://${IpAddress}/update"
-    $response = & curl.exe -s -S --fail -F "update=@$destBin" $uri 2>&1
+    $response = & curl.exe -s -S --fail --connect-timeout 6 --max-time 60 -F "update=@$destBin" $uri 2>&1
     
     if ($LASTEXITCODE -eq 0 -and $response -match "success") {
         Write-Host "Web OTA Upload Successful! Response: $response" -ForegroundColor Green

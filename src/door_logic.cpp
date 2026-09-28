@@ -342,12 +342,6 @@ void handleToggle() {
     server.send(403, "application/json", "{\"status\":\"error\", \"message\":\"Cross-origin request forbidden\"}");
     return;
   }
-#if ENABLE_WEB_AUTH && WEB_AUTH_PROTECT_ACTUATORS
-  if (!server.authenticate(WEB_AUTH_USER, WEB_AUTH_PASS)) {
-    server.requestAuthentication();
-    return;
-  }
-#endif
   DoorStateLock lock;
   if (!lock.acquired) {
     server.send(503, "application/json", "{\"status\":\"error\", \"message\":\"Door controller busy\"}");
@@ -456,12 +450,6 @@ void handleOn() {
     server.send(403, "application/json", "{\"status\":\"error\", \"message\":\"Cross-origin request forbidden\"}");
     return;
   }
-#if ENABLE_WEB_AUTH && WEB_AUTH_PROTECT_ACTUATORS
-  if (!server.authenticate(WEB_AUTH_USER, WEB_AUTH_PASS)) {
-    server.requestAuthentication();
-    return;
-  }
-#endif
   DoorStateLock lock;
   if (!lock.acquired) {
     server.send(503, "application/json", "{\"status\":\"error\", \"message\":\"Door controller busy\"}");
@@ -541,12 +529,6 @@ void handleOff() {
     server.send(403, "application/json", "{\"status\":\"error\", \"message\":\"Cross-origin request forbidden\"}");
     return;
   }
-#if ENABLE_WEB_AUTH && WEB_AUTH_PROTECT_ACTUATORS
-  if (!server.authenticate(WEB_AUTH_USER, WEB_AUTH_PASS)) {
-    server.requestAuthentication();
-    return;
-  }
-#endif
   DoorStateLock lock;
   if (!lock.acquired) {
     server.send(503, "application/json", "{\"status\":\"error\", \"message\":\"Door controller busy\"}");

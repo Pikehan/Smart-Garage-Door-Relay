@@ -58,16 +58,7 @@ const unsigned long NVS_WRITE_COOLDOWN_MS = 300000UL;    // 5 minutes cooldown b
   #define ENABLE_WIFI_SLEEP 0            // Set to 0 to prevent 100-1000ms latency spikes; 1 for modem sleep
 #endif
 #ifndef ENABLE_WEB_AUTH
-  #define ENABLE_WEB_AUTH 1              // Enable basic auth on sensitive endpoints
-#endif
-#ifndef WEB_AUTH_PROTECT_ACTUATORS
-  #define WEB_AUTH_PROTECT_ACTUATORS 0   // 0 = open local actuators; 1 = require auth for /toggle, /on, /off
-#endif
-#ifndef WEB_AUTH_USER
-  #define WEB_AUTH_USER "admin"
-#endif
-#ifndef WEB_AUTH_PASS
-  #define WEB_AUTH_PASS "garage1234"
+  #define ENABLE_WEB_AUTH 0              // Set to 1 to enable basic auth; 0 for open local network access
 #endif
 #ifndef DEFAULT_AP_PASS
   #define DEFAULT_AP_PASS "garage1234"
