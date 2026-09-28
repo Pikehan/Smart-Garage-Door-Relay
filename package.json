@@ -1,0 +1,21 @@
+{
+  "name": "garage-door-controller",
+  "version": "1.0.0",
+  "description": "ESP32 Local Offline Garage Door Controller Firmware & Test Suite",
+  "scripts": {
+    "test": "node test/test_logic.js",
+    "flash": "powershell -ExecutionPolicy Bypass -File tools/usb/usb_upload.ps1",
+    "flash:monitor": "powershell -ExecutionPolicy Bypass -File tools/usb/usb_upload.ps1 -Monitor",
+    "ota": "powershell -ExecutionPolicy Bypass -File tools/ota/ota_upload.ps1",
+    "build:bin": "powershell -ExecutionPolicy Bypass -File tools/build/build_bin.ps1"
+  },
+  "keywords": [
+    "esp32",
+    "garage-door",
+    "platformio",
+    "iot",
+    "home-automation"
+  ],
+  "author": "",
+  "license": "ISC"
+}

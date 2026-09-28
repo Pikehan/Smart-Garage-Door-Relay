@@ -1,0 +1,79 @@
+# PlatformIO & IDE
+.pio/
+.vscode/
+compile_commands.json
+
+
+# Sensitive Credentials & Envs
+include/secrets.h
+secrets.h
+.env
+.env.*
+*.env
+*.key
+*.pem
+*.pfx
+*.keystore
+id_rsa*
+
+# Node & Testing
+node_modules/
+npm-debug.log*
+coverage/
+
+# Python / Rust / Java Dependencies
+__pycache__/
+*.pyc
+.venv/
+venv/
+.gradle/
+target/
+
+# Build & Firmware Artifacts
+firmware.bin
+bin/
+/bin/
+bin
+*.bin
+*.elf
+*.hex
+*.tmp
+*.bak
+*.o
+*.exe
+*.dll
+*.so
+*.dylib
+*.class
+*.map
+/dist/
+/build/
+/out/
+
+# OS & Logs
+.DS_Store
+._*
+Thumbs.db
+desktop.ini
+*.log
+
+# Editor & IDE
+.idea/
+*.swp
+*.swo
+*~
+
+# Local Databases & Sensitive Data
+*.sqlite
+*.db
+*.sql
+
+# Local Documentation (Kept locally, excluded from public repository)
+docs/
+AGENTS.md
+agents.md
+
+# Simulator
+tools/simulator/
+simulator/
+
