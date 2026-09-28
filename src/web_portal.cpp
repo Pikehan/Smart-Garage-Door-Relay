@@ -21,15 +21,59 @@ static String activePassBackup;
 
 static Preferences wifiPrefs;
 
-void sendCORSHeaders() {
+void sendReadOnlyCORSHeaders() {
   server.sendHeader("Access-Control-Allow-Origin", "*");
-  server.sendHeader("Access-Control-Allow-Methods", "GET, POST, OPTIONS");
-  server.sendHeader("Access-Control-Allow-Headers", "*");
+  server.sendHeader("Access-Control-Allow-Methods", "GET, OPTIONS");
+  server.sendHeader("Access-Control-Allow-Headers", "Content-Type");
+}
+
+void sendCORSHeaders() {
+  sendReadOnlyCORSHeaders();
 }
 
 void handleOptions() {
-  sendCORSHeaders();
+  sendReadOnlyCORSHeaders();
   server.send(204, "text/plain", "");
+}
+
+static bool checkWebAuth() {
+#if ENABLE_WEB_AUTH
+  if (!server.authenticate(WEB_AUTH_USER, WEB_AUTH_PASS)) {
+    server.requestAuthentication();
+    return false;
+  }
+#endif
+  return true;
+}
+
+bool isSameOriginRequest() {
+  String target = server.hasHeader("Origin") ? server.header("Origin") : (server.hasHeader("Referer") ? server.header("Referer") : "");
+  if (target.length() == 0) return true;
+
+  // Strip protocol
+  int start = 0;
+  if (target.startsWith("http://")) start = 7;
+  else if (target.startsWith("https://")) start = 8;
+  int end = target.indexOf('/', start);
+  String host = (end != -1) ? target.substring(start, end) : target.substring(start);
+  int portIdx = host.indexOf(':');
+  if (portIdx != -1) host = host.substring(0, portIdx);
+
+  // Exact hostname equality checks
+  String srvHost = server.hostHeader();
+  int srvPortIdx = srvHost.indexOf(':');
+  if (srvPortIdx != -1) srvHost = srvHost.substring(0, srvPortIdx);
+
+  if (host.equalsIgnoreCase(srvHost) ||
+      host.equalsIgnoreCase(DEVICE_HOSTNAME) ||
+      host.equalsIgnoreCase(String(DEVICE_HOSTNAME) + ".local") ||
+      host == WiFi.localIP().toString() ||
+      host == WiFi.softAPIP().toString() ||
+      host == "localhost" || host == "127.0.0.1") {
+    return true;
+  }
+  Serial.printf("[Security] Blocked cross-origin request from: %s (Parsed Host: %s)\n", target.c_str(), host.c_str());
+  return false;
 }
 
 // Wi-Fi credentials in NVS Flash
@@ -69,10 +113,12 @@ static void startSoftAPPortal() {
   if (apModeActive) return;
   apModeActive = true;
   WiFi.mode(WIFI_AP_STA);
-  WiFi.softAP("Garage-Door-Setup", "garage1234");
-  Serial.print("[WiFi] SoftAP started! Connect to 'Garage-Door-Setup' (PW: garage1234) at IP: ");
+  WiFi.softAP("Garage-Door-Setup", DEFAULT_AP_PASS);
+  Serial.print("[WiFi] SoftAP started! Connect to 'Garage-Door-Setup' at IP: ");
   Serial.println(WiFi.softAPIP());
 }
+
+static volatile bool mdnsPending = false;
 
 void onWiFiEvent(WiFiEvent_t event) {
   switch (event) {
@@ -80,10 +126,7 @@ void onWiFiEvent(WiFiEvent_t event) {
       wifiConnected = true;
       Serial.print("\n[WiFi] Connected! IP Address: ");
       Serial.println(WiFi.localIP());
-      if (MDNS.begin(DEVICE_HOSTNAME)) {
-        MDNS.addService("http", "tcp", 80);
-        Serial.printf("[mDNS] Responder active: http://%s.local\n", DEVICE_HOSTNAME);
-      }
+      mdnsPending = true;
       break;
     case ARDUINO_EVENT_WIFI_STA_DISCONNECTED:
       wifiConnected = false;
@@ -150,12 +193,9 @@ void initWiFi() {
   Serial.println("\n[WiFi] Initializing Wi-Fi Station Mode from NVS...");
   triggerWiFiConnect();
 
-  // Allow initial connection window while servicing door logic
+  // Allow initial connection window
   unsigned long start = millis();
   while (!wifiConnected && (millis() - start < 3000)) {
-    handleRelay();
-    checkSensorsWithDebounce();
-    updateLogic();
     delay(10);
   }
 
@@ -167,6 +207,14 @@ void initWiFi() {
 }
 
 void handleWiFiReconnection() {
+  if (mdnsPending && wifiConnected) {
+    mdnsPending = false;
+    if (MDNS.begin(DEVICE_HOSTNAME)) {
+      MDNS.addService("http", "tcp", 80);
+      Serial.printf("[mDNS] Responder active: http://%s.local\n", DEVICE_HOSTNAME);
+    }
+  }
+
   if (activeSsidPrimary.length() == 0 && activeSsidBackup.length() == 0) {
     if (!apModeActive) {
       startSoftAPPortal();
@@ -198,9 +246,36 @@ void validateAppRollback() {
 }
 
 void handleGetState() {
-  sendCORSHeaders();
-  char json[384];
+  sendReadOnlyCORSHeaders();
+  char json[512];
   unsigned long uptimeSec = millis() / 1000;
+  uint8_t posPct;
+  DoorState curr;
+  bool openSens, closedSens, obsWarn, sensFault, sensTimeout, failedMove, midStall, isCal, unseated;
+  DoorState lastDir;
+  unsigned long openDur, closeDur;
+
+  {
+    DoorStateLock lock;
+    if (!lock.acquired) {
+      server.send(503, "application/json", "{\"status\":\"error\",\"message\":\"Door controller busy\"}");
+      return;
+    }
+    posPct = calculateCurrentPosition();
+    curr = currentState;
+    openSens = realOpenSensor;
+    closedSens = realClosedSensor;
+    obsWarn = obstacleWarning;
+    sensFault = sensorFault;
+    sensTimeout = sensorTimeoutError;
+    failedMove = failedToMove;
+    midStall = midTrackStall;
+    lastDir = lastCommandedDirection;
+    openDur = openDurationMs;
+    closeDur = closeDurationMs;
+    isCal = isCalibrated;
+    unseated = switchUnseated;
+  }
 
   snprintf(json, sizeof(json),
     "{"
@@ -213,18 +288,28 @@ void handleGetState() {
       "\"failed_to_move\":%s,"
       "\"mid_track_stall\":%s,"
       "\"last_commanded_direction\":\"%s\","
-      "\"uptime_seconds\":%lu"
+      "\"uptime_seconds\":%lu,"
+      "\"position_pct\":%u,"
+      "\"open_duration_ms\":%lu,"
+      "\"close_duration_ms\":%lu,"
+      "\"is_calibrated\":%s,"
+      "\"switch_unseated\":%s"
     "}",
-    getDebugString(currentState),
-    realOpenSensor ? "true" : "false",
-    realClosedSensor ? "true" : "false",
-    obstacleWarning ? "true" : "false",
-    sensorFault ? "true" : "false",
-    sensorTimeoutError ? "true" : "false",
-    failedToMove ? "true" : "false",
-    midTrackStall ? "true" : "false",
-    getDebugString(lastCommandedDirection),
-    uptimeSec
+    getDebugString(curr),
+    openSens ? "true" : "false",
+    closedSens ? "true" : "false",
+    obsWarn ? "true" : "false",
+    sensFault ? "true" : "false",
+    sensTimeout ? "true" : "false",
+    failedMove ? "true" : "false",
+    midStall ? "true" : "false",
+    getDebugString(lastDir),
+    uptimeSec,
+    posPct,
+    openDur,
+    closeDur,
+    isCal ? "true" : "false",
+    unseated ? "true" : "false"
   );
 
   server.sendHeader("Cache-Control", "no-cache, no-store, must-revalidate");
@@ -280,7 +365,7 @@ header{display:flex;flex-wrap:wrap;justify-content:space-between;align-items:cen
 .state-UNKNOWN{background:rgba(148,163,184,0.15);color:#cbd5e1;border-color:rgba(148,163,184,0.35)}
 @keyframes pulse{0%,100%{opacity:1;transform:scale(1)}50%{opacity:0.85;transform:scale(0.985)}}
 .door-graphic-box{width:200px;height:130px;background:#050912;border:3px solid #334155;border-radius:8px;position:relative;overflow:hidden}
-.door-slats{position:absolute;top:0;left:0;right:0;bottom:0;background:repeating-linear-gradient(0deg,#1e293b,#1e293b 10px,#0b1222 10px,#0b1222 20px);border-bottom:4px solid #64748b;transition:transform 0.6s cubic-bezier(0.4,0,0.2,1)}
+.door-slats{position:absolute;top:0;left:0;right:0;bottom:0;background:repeating-linear-gradient(0deg,#1e293b,#1e293b 10px,#0b1222 10px,#0b1222 20px);border-bottom:4px solid #64748b;will-change:transform}
 .door-handle{position:absolute;bottom:8px;left:50%;transform:translateX(-50%);width:32px;height:6px;background:#94a3b8;border-radius:3px}
 .door-controls{display:grid;grid-template-columns:1fr 1fr 1fr;gap:10px;width:100%}
 .btn-action{padding:14px 10px;font-size:0.95rem;font-weight:700;border-radius:10px;border:none;cursor:pointer;display:flex;flex-direction:column;align-items:center;justify-content:center;gap:6px;transition:all .15s ease}
@@ -295,6 +380,9 @@ header{display:flex;flex-wrap:wrap;justify-content:space-between;align-items:cen
 .lockout-progress{height:100%;background:var(--accent);width:0%;transition:width 0.1s linear}
 .telemetry-grid{display:grid;grid-template-columns:1fr 1fr;gap:10px}
 .tele-item{background:#080d1a;border:1px solid #1e293b;border-radius:8px;padding:10px 12px;display:flex;flex-direction:column;gap:3px}
+.tele-item.clickable{cursor:pointer;transition:all .15s ease;user-select:none}
+.tele-item.clickable:hover{border-color:var(--accent);background:#0d1527;box-shadow:0 0 12px var(--accent-glow);transform:translateY(-1px)}
+.tele-item.clickable:active{transform:translateY(0)}
 .tele-label{font-size:0.75rem;color:var(--muted);font-weight:600;text-transform:uppercase;letter-spacing:0.03em}
 .tele-val{font-size:0.88rem;font-weight:700;display:flex;align-items:center;gap:6px}
 .tele-val.active{color:#34d399}
@@ -324,7 +412,7 @@ header{display:flex;flex-wrap:wrap;justify-content:space-between;align-items:cen
       <div>
         <h1>ESP32 Garage Door</h1>
         <div class="brand-meta">
-          <span>IP: <strong>192.168.1.33</strong></span> &bull;
+          <span>IP: <strong id="hostIpDisplay">--</strong></span> &bull;
           <span>garage-door.local</span> &bull;
           <span id="connPill" class="status-pill online"><span class="dot"></span><span id="connText">Online</span></span>
         </div>
@@ -360,8 +448,9 @@ header{display:flex;flex-wrap:wrap;justify-content:space-between;align-items:cen
 
       <div class="door-hero">
         <div class="door-graphic-box">
-          <div id="doorTrack" class="door-slats" style="transform:translateY(0%)"></div>
-          <div class="door-handle"></div>
+          <div id="doorTrack" class="door-slats" style="transform:translateY(0%)">
+            <div class="door-handle"></div>
+          </div>
         </div>
         <div id="doorStateBadge" class="state-badge state-UNKNOWN">UNKNOWN</div>
         <div id="doorSubtext" style="font-size:0.85rem;color:var(--muted)">Polling controller status...</div>
@@ -416,6 +505,17 @@ header{display:flex;flex-wrap:wrap;justify-content:space-between;align-items:cen
           <span class="tele-label">Failed To Move</span>
           <span id="flagFailedToMove" class="tele-val inactive">CLEAR</span>
         </div>
+        <div class="tele-item clickable" onclick="sendCmd('/calibrate/reset','POST')" title="Click to reset calibration & daily quota immediately">
+          <div style="display:flex;justify-content:space-between;align-items:center">
+            <span class="tele-label">Calibrated Flight</span>
+            <span style="font-size:0.68rem;color:var(--accent);font-weight:700;letter-spacing:0.02em">RESET ↺</span>
+          </div>
+          <span id="calFlight" class="tele-val">17.0s / 17.0s</span>
+        </div>
+        <div class="tele-item">
+          <span class="tele-label">Estimated Position</span>
+          <span id="posValue" class="tele-val">0%</span>
+        </div>
         <div class="tele-item">
           <span class="tele-label">Last Commanded</span>
           <span id="lastDirection" class="tele-val">NONE</span>
@@ -442,6 +542,7 @@ header{display:flex;flex-wrap:wrap;justify-content:space-between;align-items:cen
           <button class="btn-api" onclick="sendCmd('/toggle','POST')">POST /toggle</button>
           <button class="btn-api" onclick="sendCmd('/on','POST')">POST /on</button>
           <button class="btn-api" onclick="sendCmd('/off','POST')">POST /off</button>
+          <button class="btn-api" onclick="sendCmd('/calibrate/reset','POST')">POST /calibrate/reset</button>
           <button class="btn-api" onclick="sendCmd('/reboot','POST')">POST /reboot</button>
           <button class="btn-api" onclick="clearLog()">Clear Log</button>
         </div>
@@ -489,22 +590,277 @@ function formatUptime(sec){
   return `${m}m ${s}s`;
 }
 
+let isFirstLoad = true;
+let clientPosPct = 0;
+let rafId = null;
+let animStartTime = null;
+let animStartPos = 0;
+let animTargetPos = 0;
+let animDurationMs = 17000;
+let animState = null;
+let pollTimeout = null;
+let openDurationMs = 17000;
+let closeDurationMs = 17000;
+let lastCommandedDir = 'NONE';
+
+function renderPosition(pct) {
+  clientPosPct = Math.max(0, Math.min(100, pct));
+  const track = document.getElementById('doorTrack');
+  if (track) {
+    track.style.transition = 'none';
+    track.style.transform = `translateY(-${(clientPosPct * 0.85).toFixed(2)}%)`;
+  }
+  const posEl = document.getElementById('posValue');
+  if (posEl) posEl.textContent = `${Math.round(clientPosPct)}%`;
+  
+  const b = document.getElementById('doorStateBadge');
+  if (b && animState) {
+    b.textContent = `${animState} (${Math.round(clientPosPct)}%)`;
+  }
+}
+
+function startClientAnimation(targetState, startPct, targetPct, durationMs) {
+  if (rafId) {
+    cancelAnimationFrame(rafId);
+    rafId = null;
+  }
+  animState = targetState;
+  animStartPos = startPct;
+  animTargetPos = targetPct;
+  animDurationMs = Math.max(300, durationMs);
+  animStartTime = performance.now();
+
+  function step(now) {
+    const elapsed = now - animStartTime;
+    const progress = Math.min(1, elapsed / animDurationMs);
+    const currentPos = animStartPos + (animTargetPos - animStartPos) * progress;
+    renderPosition(currentPos);
+
+    if (progress < 1 && animState === targetState) {
+      rafId = requestAnimationFrame(step);
+    } else {
+      rafId = null;
+      const finishedState = animState;
+      animState = null;
+      renderPosition(animTargetPos);
+      const b = document.getElementById('doorStateBadge');
+      if (b) {
+        if (finishedState === 'OPENING' && animTargetPos >= 100) {
+          b.className = 'state-badge state-OPEN';
+          b.textContent = 'OPEN';
+        } else if (finishedState === 'CLOSING' && animTargetPos <= 0) {
+          b.className = 'state-badge state-CLOSED';
+          b.textContent = 'CLOSED';
+        } else if (finishedState === 'STOPPED') {
+          b.className = 'state-badge state-STOPPED';
+          b.textContent = `STOPPED (${Math.round(animTargetPos)}%)`;
+        }
+      }
+    }
+  }
+
+  rafId = requestAnimationFrame(step);
+}
+
+function stopClientAnimation(finalPct) {
+  if (rafId) {
+    cancelAnimationFrame(rafId);
+    rafId = null;
+  }
+  animState = null;
+  if (finalPct !== null && finalPct !== undefined) {
+    renderPosition(finalPct);
+  }
+}
+
+function handleDirectReaction(path) {
+  if (path === '/on') {
+    if (animState !== 'OPENING' && clientPosPct < 100) {
+      const remPct = Math.max(0, 100 - clientPosPct);
+      const remDur = Math.round((openDurationMs * remPct) / 100);
+      const b = document.getElementById('doorStateBadge');
+      if (b) {
+        b.className = 'state-badge state-OPENING';
+        b.textContent = `OPENING (${Math.round(clientPosPct)}%)`;
+      }
+      lastCommandedDir = 'OPENING';
+      startClientAnimation('OPENING', clientPosPct, 100, remDur);
+    }
+  } else if (path === '/off') {
+    if (animState !== 'CLOSING' && clientPosPct > 0) {
+      const remPct = Math.max(0, clientPosPct);
+      const remDur = Math.round((closeDurationMs * remPct) / 100);
+      const b = document.getElementById('doorStateBadge');
+      if (b) {
+        b.className = 'state-badge state-CLOSING';
+        b.textContent = `CLOSING (${Math.round(clientPosPct)}%)`;
+      }
+      lastCommandedDir = 'CLOSING';
+      startClientAnimation('CLOSING', clientPosPct, 0, remDur);
+    }
+  } else if (path === '/toggle') {
+    if (animState === 'OPENING' || animState === 'CLOSING') {
+      lastCommandedDir = animState;
+      stopClientAnimation(clientPosPct);
+      const b = document.getElementById('doorStateBadge');
+      if (b) {
+        b.className = 'state-badge state-STOPPED';
+        b.textContent = `STOPPED (${Math.round(clientPosPct)}%)`;
+      }
+    } else if (clientPosPct <= 0 || lastState === 'CLOSED') {
+      const remPct = Math.max(0, 100 - clientPosPct);
+      const remDur = Math.round((openDurationMs * remPct) / 100);
+      const b = document.getElementById('doorStateBadge');
+      if (b) {
+        b.className = 'state-badge state-OPENING';
+        b.textContent = `OPENING (${Math.round(clientPosPct)}%)`;
+      }
+      lastCommandedDir = 'OPENING';
+      startClientAnimation('OPENING', clientPosPct, 100, remDur);
+    } else if (clientPosPct >= 100 || lastState === 'OPEN') {
+      const remPct = Math.max(0, clientPosPct);
+      const remDur = Math.round((closeDurationMs * remPct) / 100);
+      const b = document.getElementById('doorStateBadge');
+      if (b) {
+        b.className = 'state-badge state-CLOSING';
+        b.textContent = `CLOSING (${Math.round(clientPosPct)}%)`;
+      }
+      lastCommandedDir = 'CLOSING';
+      startClientAnimation('CLOSING', clientPosPct, 0, remDur);
+    } else {
+      if (lastCommandedDir === 'OPENING') {
+        const remPct = Math.max(0, clientPosPct);
+        const remDur = Math.round((closeDurationMs * remPct) / 100);
+        const b = document.getElementById('doorStateBadge');
+        if (b) {
+          b.className = 'state-badge state-CLOSING';
+          b.textContent = `CLOSING (${Math.round(clientPosPct)}%)`;
+        }
+        lastCommandedDir = 'CLOSING';
+        startClientAnimation('CLOSING', clientPosPct, 0, remDur);
+      } else {
+        const remPct = Math.max(0, 100 - clientPosPct);
+        const remDur = Math.round((openDurationMs * remPct) / 100);
+        const b = document.getElementById('doorStateBadge');
+        if (b) {
+          b.className = 'state-badge state-OPENING';
+          b.textContent = `OPENING (${Math.round(clientPosPct)}%)`;
+        }
+        lastCommandedDir = 'OPENING';
+        startClientAnimation('OPENING', clientPosPct, 100, remDur);
+      }
+    }
+  }
+}
+
 function updateUI(data){
-  lastState = data.state;
+  const state = (data.state || '').toUpperCase();
+  lastState = state;
   document.getElementById('lastUpdated').textContent = 'Live • ' + new Date().toLocaleTimeString();
 
-  // State Badge
-  const b = document.getElementById('doorStateBadge');
-  b.className = 'state-badge state-' + data.state;
-  b.textContent = data.state;
+  if (data.last_commanded_direction) {
+    lastCommandedDir = data.last_commanded_direction.toUpperCase();
+  }
 
-  // Door Graphic animation
-  const track = document.getElementById('doorTrack');
-  if(data.state === 'OPEN') track.style.transform = 'translateY(-85%)';
-  else if(data.state === 'CLOSED') track.style.transform = 'translateY(0%)';
-  else if(data.state === 'OPENING') track.style.transform = 'translateY(-45%)';
-  else if(data.state === 'CLOSING') track.style.transform = 'translateY(-30%)';
-  else track.style.transform = 'translateY(-50%)';
+  // Calibration sync
+  if (typeof data.open_duration_ms === 'number' && data.open_duration_ms >= 5000) {
+    openDurationMs = data.open_duration_ms;
+  }
+  if (typeof data.close_duration_ms === 'number' && data.close_duration_ms >= 5000) {
+    closeDurationMs = data.close_duration_ms;
+  }
+
+  const serverPos = (data.position_pct !== undefined) ? data.position_pct : clientPosPct;
+
+  // State Badge styling
+  const b = document.getElementById('doorStateBadge');
+
+  if (isFirstLoad) {
+    if (state === 'OPEN') {
+      stopClientAnimation(100);
+    } else if (state === 'CLOSED') {
+      stopClientAnimation(0);
+    } else if (state === 'OPENING') {
+      const startPct = (serverPos < 100) ? serverPos : 0;
+      const remDur = Math.round(((100 - startPct) / 100) * openDurationMs);
+      startClientAnimation('OPENING', startPct, 100, remDur);
+    } else if (state === 'CLOSING') {
+      const startPct = (serverPos > 0) ? serverPos : 100;
+      const remDur = Math.round((startPct / 100) * closeDurationMs);
+      startClientAnimation('CLOSING', startPct, 0, remDur);
+    } else {
+      stopClientAnimation(serverPos);
+    }
+    isFirstLoad = false;
+  } else {
+    // Difference check: if difference > 5%, smoothly correct; otherwise don't change
+    if (state === 'OPEN') {
+      const diff = Math.abs(clientPosPct - 100);
+      if (animState === 'OPENING') {
+        if (diff > 5) {
+          startClientAnimation('OPENING', clientPosPct, 100, 400);
+        }
+      } else {
+        if (diff > 5) {
+          startClientAnimation('OPENING', clientPosPct, 100, 400);
+        } else {
+          stopClientAnimation(100);
+        }
+      }
+    } else if (state === 'CLOSED') {
+      const diff = Math.abs(clientPosPct - 0);
+      if (animState === 'CLOSING') {
+        if (diff > 5) {
+          startClientAnimation('CLOSING', clientPosPct, 0, 400);
+        }
+      } else {
+        if (diff > 5) {
+          startClientAnimation('CLOSING', clientPosPct, 0, 400);
+        } else {
+          stopClientAnimation(0);
+        }
+      }
+    } else if (state === 'STOPPED') {
+      const diff = Math.abs(clientPosPct - serverPos);
+      if (diff > 5) {
+        startClientAnimation('STOPPED', clientPosPct, serverPos, 500);
+      } else {
+        if (animState !== null) {
+          stopClientAnimation(clientPosPct);
+        }
+      }
+    } else if (state === 'OPENING') {
+      const diff = Math.abs(clientPosPct - serverPos);
+      const remDur = Math.max(800, Math.round(((100 - serverPos) / 100) * openDurationMs));
+      if (animState === 'OPENING') {
+        if (diff > 5) {
+          startClientAnimation('OPENING', clientPosPct, 100, remDur);
+        }
+      } else {
+        startClientAnimation('OPENING', clientPosPct, 100, remDur);
+      }
+    } else if (state === 'CLOSING') {
+      const diff = Math.abs(clientPosPct - serverPos);
+      const remDur = Math.max(800, Math.round((serverPos / 100) * closeDurationMs));
+      if (animState === 'CLOSING') {
+        if (diff > 5) {
+          startClientAnimation('CLOSING', clientPosPct, 0, remDur);
+        }
+      } else {
+        startClientAnimation('CLOSING', clientPosPct, 0, remDur);
+      }
+    }
+  }
+
+  if (b) {
+    b.className = 'state-badge state-' + state;
+    if (animState === null) {
+      if (state === 'OPEN') b.textContent = 'OPEN';
+      else if (state === 'CLOSED') b.textContent = 'CLOSED';
+      else if (state === 'STOPPED') b.textContent = `STOPPED (${Math.round(clientPosPct)}%)`;
+      else b.textContent = `${state} (${Math.round(clientPosPct)}%)`;
+    }
+  }
 
   // Subtext
   document.getElementById('doorSubtext').textContent =
@@ -522,13 +878,27 @@ function updateUI(data){
   // Flags
   function setFlag(elId, val, alertText='ALERT', okText='CLEAR'){
     const el = document.getElementById(elId);
-    el.className = 'tele-val ' + (val ? 'alert' : 'inactive');
-    el.textContent = val ? alertText : okText;
+    if(el) {
+      el.className = 'tele-val ' + (val ? 'alert' : 'inactive');
+      el.textContent = val ? alertText : okText;
+    }
   }
   setFlag('flagObstacle', data.obstacle_warning, 'DETECTED');
   setFlag('flagSensorFault', data.sensor_fault, 'FAULT');
   setFlag('flagStall', data.mid_track_stall, 'STALLED');
   setFlag('flagFailedToMove', data.failed_to_move, 'STUCK');
+
+  // Calibration and Position Telemetry
+  const openSec = (openDurationMs / 1000).toFixed(1);
+  const closeSec = (closeDurationMs / 1000).toFixed(1);
+  const calBadge = data.is_calibrated ? ' (Calibrated)' : ' (Default)';
+  const calEl = document.getElementById('calFlight');
+  if(calEl) calEl.textContent = `${openSec}s / ${closeSec}s${calBadge}`;
+
+  if (animState === null) {
+    const posEl = document.getElementById('posValue');
+    if (posEl) posEl.textContent = `${Math.round(clientPosPct)}%`;
+  }
 
   document.getElementById('lastDirection').textContent = data.last_commanded_direction || 'NONE';
   document.getElementById('uptimeVal').textContent = formatUptime(data.uptime_seconds || 0);
@@ -550,20 +920,30 @@ function startLockout(){
 }
 
 async function fetchState(){
+  clearTimeout(pollTimeout);
   try{
     const res = await fetch('/state');
     if(!res.ok) throw new Error('HTTP ' + res.status);
     const data = await res.json();
     updateUI(data);
+
+    // Client-side RAF engine drives 60fps animations; keep polling at relaxed 2000ms
+    if (document.visibilityState === 'visible') {
+      pollTimeout = setTimeout(fetchState, 2000);
+    }
   }catch(e){
     const p = document.getElementById('connPill');
     p.className = 'status-pill offline';
     document.getElementById('connText').textContent = 'Offline';
+    if (document.visibilityState === 'visible') {
+      pollTimeout = setTimeout(fetchState, 3000);
+    }
   }
 }
 
 async function sendCmd(path, methodOrLabel){
   startLockout();
+  handleDirectReaction(path);
   const method = (path === '/state') ? 'GET' : 'POST';
   try{
     log(`Sending ${method} ${path}...`);
@@ -592,9 +972,15 @@ async function rebootEsp(){
   }
 }
 
-setInterval(()=>{
+document.addEventListener('visibilitychange', ()=>{
   if(document.visibilityState === 'visible') fetchState();
-}, 2000);
+  else clearTimeout(pollTimeout);
+});
+
+const hostEl = document.getElementById('hostIpDisplay');
+if (hostEl) {
+  hostEl.textContent = window.location.hostname || '192.168.1.33';
+}
 
 fetchState();
 </script>
@@ -612,7 +998,11 @@ void handleRoot() {
 }
 
 void handleReboot() {
-  sendCORSHeaders();
+  if (!isSameOriginRequest()) {
+    server.send(403, "application/json", "{\"status\":\"error\",\"message\":\"Cross-origin request forbidden\"}");
+    return;
+  }
+  if (!checkWebAuth()) return;
   server.send(200, "application/json", "{\"status\":\"success\",\"message\":\"Rebooting ESP32 controller...\"}");
   delay(1000);
   ESP.restart();
@@ -627,40 +1017,43 @@ void handleNotFound() {
   server.send(404, "application/json", "{\"error\":\"Endpoint or Method not found. Available: GET /, /state, /update, /setup | POST /toggle, /on, /off, /reboot, /update, /setup.\"}");
 }
 
+static const char SETUP_PAGE_HTML[] PROGMEM = R"rawliteral(<!DOCTYPE html><html><head><meta charset='utf-8'><meta name='viewport' content='width=device-width,initial-scale=1'>
+<title>Garage Door Controller - Wi-Fi Setup</title>
+<style>
+body{font-family:system-ui,-apple-system,sans-serif;background:#0f172a;color:#e2e8f0;display:flex;align-items:center;justify-content:center;min-height:100vh;margin:0;padding:20px;box-sizing:border-box}
+.card{background:#1e293b;border:1px solid #334155;border-radius:12px;padding:24px;width:100%;max-width:400px;box-shadow:0 10px 25px rgba(0,0,0,0.5)}
+h2{margin-top:0;font-size:1.3rem;color:#38bdf8;text-align:center}
+p{font-size:0.875rem;color:#94a3b8;line-height:1.4}
+label{display:block;margin-top:14px;font-size:0.85rem;color:#cbd5e1;font-weight:600}
+input{width:100%;box-sizing:border-box;background:#0f172a;border:1px solid #475569;border-radius:6px;padding:10px 12px;color:#f8fafc;font-size:0.95rem;margin-top:6px}
+input:focus{outline:none;border-color:#38bdf8}
+button{width:100%;margin-top:20px;padding:12px;border:none;border-radius:6px;background:#0284c7;color:#fff;font-size:1rem;font-weight:bold;cursor:pointer;transition:background 0.2s}
+button:hover{background:#0369a1}
+</style></head><body>
+<div class='card'>
+<h2>Wi-Fi Setup</h2>
+<p>Enter network credentials for the garage door controller. Credentials will be safely stored in NVS Flash.</p>
+<form method='POST' action='/setup'>
+<label>Primary Wi-Fi SSID</label><input type='text' name='ssid' required>
+<label>Primary Wi-Fi Password</label><input type='password' name='pass'>
+<label>Backup Wi-Fi SSID (Optional)</label><input type='text' name='bak_ssid'>
+<label>Backup Wi-Fi Password (Optional)</label><input type='password' name='bak_pass'>
+<button type='submit'>Save & Connect</button>
+</form>
+<div style='margin-top:16px;text-align:center'><a href='/' style='color:#38bdf8;text-decoration:none;font-size:0.875rem'>&larr; Back to Dashboard</a></div>
+</div></body></html>)rawliteral";
+
 void handleSetupForm() {
-  sendCORSHeaders();
-
-  String html = F("<!DOCTYPE html><html><head><meta charset='utf-8'><meta name='viewport' content='width=device-width,initial-scale=1'>"
-    "<title>Garage Door Controller - Wi-Fi Setup</title>"
-    "<style>"
-    "body{font-family:system-ui,-apple-system,sans-serif;background:#0f172a;color:#e2e8f0;display:flex;align-items:center;justify-content:center;min-height:100vh;margin:0;padding:20px;box-sizing:border-box}"
-    ".card{background:#1e293b;border:1px solid #334155;border-radius:12px;padding:24px;width:100%;max-width:400px;box-shadow:0 10px 25px rgba(0,0,0,0.5)}"
-    "h2{margin-top:0;font-size:1.3rem;color:#38bdf8;text-align:center}"
-    "p{font-size:0.875rem;color:#94a3b8;line-height:1.4}"
-    "label{display:block;margin-top:14px;font-size:0.85rem;color:#cbd5e1;font-weight:600}"
-    "input{width:100%;box-sizing:border-box;background:#0f172a;border:1px solid #475569;border-radius:6px;padding:10px 12px;color:#f8fafc;font-size:0.95rem;margin-top:6px}"
-    "input:focus{outline:none;border-color:#38bdf8}"
-    "button{width:100%;margin-top:20px;padding:12px;border:none;border-radius:6px;background:#0284c7;color:#fff;font-size:1rem;font-weight:bold;cursor:pointer;transition:background 0.2s}"
-    "button:hover{background:#0369a1}"
-    "</style></head><body>"
-    "<div class='card'>"
-    "<h2>Wi-Fi Setup</h2>"
-    "<p>Enter network credentials for the garage door controller. Credentials will be safely stored in NVS Flash.</p>"
-    "<form method='POST' action='/setup'>"
-    "<label>Primary Wi-Fi SSID</label><input type='text' name='ssid' required>"
-    "<label>Primary Wi-Fi Password</label><input type='password' name='pass'>"
-    "<label>Backup Wi-Fi SSID (Optional)</label><input type='text' name='bak_ssid'>"
-    "<label>Backup Wi-Fi Password (Optional)</label><input type='password' name='bak_pass'>"
-    "<button type='submit'>Save & Connect</button>"
-    "</form>"
-    "<div style='margin-top:16px;text-align:center'><a href='/' style='color:#38bdf8;text-decoration:none;font-size:0.875rem'>&larr; Back to Dashboard</a></div>"
-    "</div></body></html>");
-
-  server.send(200, "text/html", html);
+  if (wifiConnected && !checkWebAuth()) return;
+  server.send_P(200, "text/html", SETUP_PAGE_HTML);
 }
 
 void handleSetupSave() {
-  sendCORSHeaders();
+  if (!isSameOriginRequest()) {
+    server.send(403, "application/json", "{\"status\":\"error\",\"message\":\"Cross-origin request forbidden\"}");
+    return;
+  }
+  if (wifiConnected && !checkWebAuth()) return;
 
   String newSsid = server.arg("ssid");
   String newPass = server.arg("pass");
@@ -685,12 +1078,15 @@ void handleSetupSave() {
 }
 
 void handleUpdateForm() {
-  sendCORSHeaders();
+  if (!checkWebAuth()) return;
 
   // Do not serve update form while door is in motion
-  if (currentState == STATE_OPENING || currentState == STATE_CLOSING) {
-    server.send(409, "text/plain", "409 Conflict: Door is moving. Firmware update is locked for physical safety.");
-    return;
+  {
+    DoorStateLock lock;
+    if (currentState == STATE_OPENING || currentState == STATE_CLOSING) {
+      server.send(409, "text/plain", "409 Conflict: Door is moving. Firmware update is locked for physical safety.");
+      return;
+    }
   }
 
   // Pre-compressed web portal asset
@@ -779,11 +1175,19 @@ void handleUpdateForm() {
 }
 
 void handleUpdateUpload() {
-  // Prevent firmware writes while door is in motion
-  if (currentState == STATE_OPENING || currentState == STATE_CLOSING) {
+  if (!checkWebAuth()) {
     Update.abort();
-    server.send(409, "text/plain", "Door in motion. Update aborted.");
     return;
+  }
+
+  // Prevent firmware writes while door is in motion
+  {
+    DoorStateLock lock;
+    if (currentState == STATE_OPENING || currentState == STATE_CLOSING) {
+      Update.abort();
+      server.send(409, "text/plain", "Door in motion. Update aborted.");
+      return;
+    }
   }
 
   // Check available heap before starting update
@@ -846,6 +1250,9 @@ void setupOTA() {
 #endif
 
 void initWebPortal() {
+  const char* headerkeys[] = {"Origin", "Referer"};
+  server.collectHeaders(headerkeys, 2);
+
   server.on("/", HTTP_GET, handleRoot);
   server.on("/", HTTP_OPTIONS, handleOptions);
 
@@ -853,20 +1260,18 @@ void initWebPortal() {
   server.on("/state", HTTP_OPTIONS, handleOptions);
 
   server.on("/toggle", HTTP_POST, handleToggle);
-  server.on("/toggle", HTTP_OPTIONS, handleOptions);
-
   server.on("/on", HTTP_POST, handleOn);
-  server.on("/on", HTTP_OPTIONS, handleOptions);
-
   server.on("/off", HTTP_POST, handleOff);
-  server.on("/off", HTTP_OPTIONS, handleOptions);
 
   server.on("/update", HTTP_GET, handleUpdateForm);
   server.on("/update", HTTP_POST, []() {
-    sendCORSHeaders();
-    if (currentState == STATE_OPENING || currentState == STATE_CLOSING) {
-      server.send(409, "application/json", "{\"status\":\"error\",\"message\":\"Door is in motion. Update locked for safety.\"}");
-      return;
+    if (!checkWebAuth()) return;
+    {
+      DoorStateLock lock;
+      if (currentState == STATE_OPENING || currentState == STATE_CLOSING) {
+        server.send(409, "application/json", "{\"status\":\"error\",\"message\":\"Door is in motion. Update locked for safety.\"}");
+        return;
+      }
     }
     bool hasError = Update.hasError();
     server.send(200, "application/json", hasError ?
@@ -877,14 +1282,12 @@ void initWebPortal() {
       ESP.restart();
     }
   }, handleUpdateUpload);
-  server.on("/update", HTTP_OPTIONS, handleOptions);
 
   server.on("/setup", HTTP_GET, handleSetupForm);
   server.on("/setup", HTTP_POST, handleSetupSave);
-  server.on("/setup", HTTP_OPTIONS, handleOptions);
 
   server.on("/reboot", HTTP_POST, handleReboot);
-  server.on("/reboot", HTTP_OPTIONS, handleOptions);
+  server.on("/calibrate/reset", HTTP_POST, handleCalibrateReset);
 
   server.onNotFound(handleNotFound);
   server.begin();
@@ -901,7 +1304,9 @@ void handleWebClients() {
 
 void handleOTA() {
 #if ENABLE_ARDUINO_OTA
-  ArduinoOTA.handle();
+  if (currentState != STATE_OPENING && currentState != STATE_CLOSING) {
+    ArduinoOTA.handle();
+  }
 #endif
 }
 

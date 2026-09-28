@@ -5,30 +5,39 @@
 
 // Core 0 task for sensor polling and relay timing
 void doorSafetyTask(void *pvParameters) {
+#if ENABLE_SERIAL_DEBUG
+  unsigned long lastStackCheck = 0;
+#endif
   for (;;) {
-    handleRelay();
-    checkSensorsWithDebounce();
-    updateLogic();
+    // Unconditionally de-assert active relay pulse regardless of mutex lock state
+    releaseRelayIfExpired();
+
+    if (doorStateMutex != NULL && xSemaphoreTakeRecursive(doorStateMutex, pdMS_TO_TICKS(50)) == pdTRUE) {
+      handleRelay();
+      checkSensorsWithDebounce();
+      updateLogic();
+      xSemaphoreGiveRecursive(doorStateMutex);
+    }
+
+#if ENABLE_SERIAL_DEBUG
+    if (millis() - lastStackCheck > 60000) {
+      lastStackCheck = millis();
+      UBaseType_t highWaterMark = uxTaskGetStackHighWaterMark(NULL);
+      Serial.printf("[Task] doorSafetyTask Stack High-Water: %u bytes remaining\n", (unsigned int)(highWaterMark * sizeof(StackType_t)));
+    }
+#endif
+
     vTaskDelay(pdMS_TO_TICKS(10));
   }
 }
 
 void setup() {
   Serial.begin(115200);
-  Serial.println("\n======================================");
-  Serial.println("   ESP32 GARAGE DOOR CONTROLLER BOOT   ");
-  Serial.println("======================================");
-
+  Serial.println("\n=== ESP32 GARAGE DOOR CONTROLLER BOOT ===");
   initDoorHardware();
-
-  // Run limit switch and relay loop on Core 0
-  xTaskCreatePinnedToCore(doorSafetyTask, "SafetyTask", 2560, NULL, 5, NULL, 0);
-
+  xTaskCreatePinnedToCore(doorSafetyTask, "SafetyTask", 4096, NULL, 5, NULL, 0);
   initWiFi();
-#if ENABLE_WIFI_SLEEP
-  WiFi.setSleep(true);
-#endif
-
+  WiFi.setSleep(ENABLE_WIFI_SLEEP ? true : false);
   initWebPortal();
   validateAppRollback();
 }

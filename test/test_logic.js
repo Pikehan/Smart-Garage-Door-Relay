@@ -19,13 +19,23 @@ const cppCode = fs.readFileSync(cppPath, 'utf8');
 let RELAY_PIN = 2;
 let OPEN_SENSOR_PIN = 25;
 let CLOSED_SENSOR_PIN = 26;
-let MOVEMENT_TIMEOUT = 22000;
+let MOVEMENT_TIMEOUT = 27000;
 let DEBOUNCE_DELAY = 50;
 let RELAY_PRESS_TIME = 200;
 let PENDING_RELAY_DELAY = 500;
 
 let COMMAND_LOCKOUT_MS = 1500;
 let SENSOR_DISENGAGE_TIMEOUT = 2500;
+
+// Calibration & Position Tracking parameters
+let DEFAULT_OPEN_DURATION_MS = 17000;
+let DEFAULT_CLOSE_DURATION_MS = 17000;
+let MIN_TRAVEL_TIME_MS = 15000;
+let MAX_TRAVEL_TIME_MS = 25000;
+let CALIBRATION_NVS_MIN_DELTA_MS = 200;
+let CALIBRATION_MAX_DEVIATION_MS = 3500;
+let CALIBRATION_INTERVAL_MS = 86400000;
+let NVS_WRITE_COOLDOWN_MS = 300000;
 
 // Enums
 const STATE_UNKNOWN = 0;
@@ -48,7 +58,7 @@ let relayTriggerTime = 0;
 let pendingState = STATE_UNKNOWN;
 let pendingPulsesCount = 0;
 
-// New Telemetry & Diagnostic Variables
+// Telemetry & Diagnostic Variables
 let obstacleWarning = false;
 let sensorFault = false;
 let sensorTimeoutError = false;
@@ -58,6 +68,21 @@ let lastCommandedDirection = STATE_UNKNOWN;
 let lastPulseTime = 0;
 let pulseVerificationPending = false;
 let pulseOriginState = STATE_UNKNOWN;
+
+// Calibration & Position Tracking variables
+let openDurationMs = 17000;
+let closeDurationMs = 17000;
+let nvsStoredOpenMs = 17000;
+let nvsStoredCloseMs = 17000;
+let isCalibrated = false;
+let currentPositionPct = 0;
+let startPositionPct = 0;
+let activeFlightStartTime = 0;
+let switchUnseated = false;
+let lastCalibrationTimeOpen = 0;
+let lastCalibrationTimeClose = 0;
+let lastNVSWriteTime = 0;
+let hasIntermediateStop = false;
 
 let pinRelayState = 1; // 1 = HIGH (OFF), 0 = LOW (ON)
 let pinOpenSensor = 1; // 1 = Inactive, 0 = Active
@@ -81,6 +106,7 @@ function digitalRead(pin) {
 }
 
 function millis() {
+  if (global.simulatedMillis !== undefined) return global.simulatedMillis;
   return Date.now();
 }
 
@@ -160,10 +186,32 @@ global.lastPulseTime = lastPulseTime;
 global.pulseVerificationPending = pulseVerificationPending;
 global.pulseOriginState = pulseOriginState;
 
+global.DEFAULT_OPEN_DURATION_MS = DEFAULT_OPEN_DURATION_MS;
+global.DEFAULT_CLOSE_DURATION_MS = DEFAULT_CLOSE_DURATION_MS;
+global.MIN_TRAVEL_TIME_MS = MIN_TRAVEL_TIME_MS;
+global.MAX_TRAVEL_TIME_MS = MAX_TRAVEL_TIME_MS;
+global.CALIBRATION_NVS_MIN_DELTA_MS = CALIBRATION_NVS_MIN_DELTA_MS;
+global.CALIBRATION_MAX_DEVIATION_MS = CALIBRATION_MAX_DEVIATION_MS;
+global.CALIBRATION_INTERVAL_MS = CALIBRATION_INTERVAL_MS;
+global.NVS_WRITE_COOLDOWN_MS = NVS_WRITE_COOLDOWN_MS;
+
+global.openDurationMs = openDurationMs;
+global.closeDurationMs = closeDurationMs;
+global.nvsStoredOpenMs = nvsStoredOpenMs;
+global.nvsStoredCloseMs = nvsStoredCloseMs;
+global.isCalibrated = isCalibrated;
+global.currentPositionPct = currentPositionPct;
+global.startPositionPct = startPositionPct;
+global.activeFlightStartTime = activeFlightStartTime;
+global.switchUnseated = switchUnseated;
+global.lastCalibrationTimeOpen = lastCalibrationTimeOpen;
+global.lastCalibrationTimeClose = lastCalibrationTimeClose;
+global.lastNVSWriteTime = lastNVSWriteTime;
+global.hasIntermediateStop = hasIntermediateStop;
+
 global.digitalWrite = digitalWrite;
 global.digitalRead = digitalRead;
 global.millis = millis;
-global.saveStateToNVS = saveStateToNVS;
 global.sendCORSHeaders = sendCORSHeaders;
 global.clearFaultFlags = clearFaultFlags;
 global.server = server;
@@ -176,17 +224,6 @@ global.nvsStore = {
   s_close: false,
   s_open: false
 };
-
-
-function saveStateToNVS() {
-  if (global.currentState !== STATE_CLOSED && global.currentState !== STATE_OPEN && global.currentState !== STATE_STOPPED) {
-    return;
-  }
-  global.nvsStore['curr'] = global.currentState;
-  global.nvsStore['prev'] = global.previousState;
-  global.nvsStore['s_close'] = global.realClosedSensor;
-  global.nvsStore['s_open'] = global.realOpenSensor;
-}
 
 
 // C++ Transpiler Helper
@@ -202,20 +239,32 @@ function transpileBodyToJS(cppBody) {
   js = js.replace(/server\.send\s*\(/g, 'global.server.send(');
   js = js.replace(/(?:WiFi|ArduinoOTA)\.[^;]+;/g, '');
   js = js.replace(/(?:pinMode|setupOTA)\s*\([^;]*\);?/g, '');
-  js = js.replace(/\((?:uint8_t|DoorState|int|uint16_t|unsigned\s+int)\)/g, '');
+  js = js.replace(/\((?:uint8_t|DoorState|int|uint16_t|unsigned\s+int|uint32_t|unsigned\s+long|long)\)/g, '');
+  js = js.replace(/\b(\d+)UL\b/g, '$1');
+  js = js.replace(/\blabs\b/g, 'Math.abs');
   js = js.replace(/\b(?:unsigned\s+long|long|int|bool|uint8_t|DoorState|char\*|const\s+char\*|String)\s+/g, 'let ');
-  js = js.replace(/Serial\.(?:println|printf|print)\s*\([^;]*\);?/g, '');
-  js = js.replace(/preferences\.getUChar\s*\(\s*"([^"]+)"\s*,\s*([^)]+)\)/g, '(global.nvsStore["$1"] !== undefined ? global.nvsStore["$1"] : $2)');
-  js = js.replace(/preferences\.getBool\s*\(\s*"([^"]+)"\s*,\s*([^)]+)\)/g, '(global.nvsStore["$1"] !== undefined ? global.nvsStore["$1"] : $2)');
-  js = js.replace(/preferences\.putUChar\s*\(\s*"([^"]+)"\s*,\s*([^)]+)\)/g, '(global.nvsStore["$1"] = $2)');
-  js = js.replace(/preferences\.putBool\s*\(\s*"([^"]+)"\s*,\s*([^)]+)\)/g, '(global.nvsStore["$1"] = $2)');
-  js = js.replace(/preferences\.(?:begin|end)\s*\([^;]*\);?/g, '');
+  js = js.replace(/^[ \t]*#(?:if|ifdef|ifndef|elif|else|endif).*$/gm, '');
+  js = js.replace(/(?:preferences|prefs)\.getUChar\s*\(\s*"([^"]+)"\s*,\s*([^)]+)\)/g, '(global.nvsStore["$1"] !== undefined ? global.nvsStore["$1"] : $2)');
+  js = js.replace(/(?:preferences|prefs)\.getBool\s*\(\s*"([^"]+)"\s*,\s*([^)]+)\)/g, '(global.nvsStore["$1"] !== undefined ? global.nvsStore["$1"] : $2)');
+  js = js.replace(/(?:preferences|prefs)\.getUInt\s*\(\s*"([^"]+)"\s*,\s*([^)]+)\)/g, '(global.nvsStore["$1"] !== undefined ? global.nvsStore["$1"] : $2)');
+  js = js.replace(/(?:preferences|prefs)\.putUChar\s*\(\s*"([^"]+)"\s*,\s*([^)]+)\)/g, '(global.nvsStore["$1"] = $2)');
+  js = js.replace(/(?:preferences|prefs)\.putBool\s*\(\s*"([^"]+)"\s*,\s*([^)]+)\)/g, '(global.nvsStore["$1"] = $2)');
+  js = js.replace(/(?:preferences|prefs)\.putUInt\s*\(\s*"([^"]+)"\s*,\s*([^)]+)\)/g, '(global.nvsStore["$1"] = $2)');
+  js = js.replace(/(?:preferences|prefs)\.(?:begin|end)\s*\([^;]*\);?/g, '');
+  js = js.replace(/Preferences\s+\w+;?/g, '');
+  js = js.replace(/if\s*\(!isSameOriginRequest\(\)\)\s*\{[\s\S]*?return;\s*\}/g, '');
+  js = js.replace(/if\s*\(!server\.authenticate\([^)]*\)\)\s*\{[\s\S]*?return;\s*\}/g, '');
+  js = js.replace(/DoorStateLock\s+\w+(?:\([^)]*\))?;?/g, '');
+  js = js.replace(/if\s*\(!lock\.acquired\)\s*\{[\s\S]*?return;\s*\}/g, '');
+  js = js.replace(/if\s*\(\s*doorStateMutex[\s\S]*?\}/g, '');
+  js = js.replace(/xSemaphore(?:CreateRecursiveMutex|TakeRecursive|GiveRecursive)\s*\([^;]*\);?/g, '');
+  js = js.replace(/doorStateMutex\s*=\s*[^;]+;/g, '');
   js = js.replace(/\bHIGH\b/g, '1').replace(/\bLOW\b/g, '0');
   return js;
 }
 
 function extractFunctionBody(code, funcName) {
-  const pattern = new RegExp('\\b(?:void|DoorState|int|bool|String)\\s+' + funcName + '\\s*\\([^)]*\\)\\s*\\{');
+  const pattern = new RegExp('\\b(?:void|DoorState|int|bool|String|uint8_t)\\s+' + funcName + '\\s*\\([^)]*\\)\\s*\\{');
   const match = code.match(pattern);
   if (!match) return null;
 
@@ -255,6 +304,11 @@ global.handleToggle = function() { return fnHandleToggle(); };
 global.checkSensorsWithDebounce = function() { fnCheckSensors(); };
 global.updateLogic = function() { fnUpdateLogic(); };
 global.setup = function() { fnSetup(); };
+global.calculateCurrentPosition = function() { return fnCalculateCurrentPosition(); };
+global.handleCalibrateReset = function() { return fnHandleCalibrateReset(); };
+global.saveStateToNVS = function() { fnSaveStateToNVS(); };
+global.releaseRelayIfExpired = function() { fnReleaseRelayIfExpired(); };
+global.isSameOriginRequest = function() { return true; };
 
 const fnTriggerRelay = compileFunc('triggerRelay');
 const fnHandleRelay = compileFunc('handleRelay');
@@ -264,6 +318,10 @@ const fnHandleToggle = compileFunc('handleToggle');
 const fnCheckSensors = compileFunc('checkSensorsWithDebounce');
 const fnUpdateLogic = compileFunc('updateLogic');
 const fnSetup = compileFunc('setup');
+const fnCalculateCurrentPosition = compileFunc('calculateCurrentPosition');
+const fnHandleCalibrateReset = compileFunc('handleCalibrateReset');
+const fnSaveStateToNVS = compileFunc('saveStateToNVS');
+const fnReleaseRelayIfExpired = compileFunc('releaseRelayIfExpired');
 
 function triggerRelay() { global.triggerRelay(); }
 function handleRelay() { global.handleRelay(); }
@@ -273,6 +331,11 @@ function handleToggle() { return global.handleToggle(); }
 function checkSensorsWithDebounce() { global.checkSensorsWithDebounce(); }
 function updateLogic() { global.updateLogic(); }
 function setup() { global.setup(); }
+function calculateCurrentPosition() { return global.calculateCurrentPosition(); }
+function handleCalibrateReset() { return global.handleCalibrateReset(); }
+function saveStateToNVS() { global.saveStateToNVS(); }
+function releaseRelayIfExpired() { global.releaseRelayIfExpired(); }
+function isSameOriginRequest() { return true; }
 
 // --- TEST RUNNER ENGINE ---
 let totalTests = 0;
@@ -311,6 +374,22 @@ function resetEnvironment() {
   global.lastPulseTime = 0;
   global.pulseVerificationPending = false;
   global.pulseOriginState = STATE_UNKNOWN;
+
+  global.openDurationMs = 17000;
+  global.closeDurationMs = 17000;
+  global.nvsStoredOpenMs = 17000;
+  global.nvsStoredCloseMs = 17000;
+  global.isCalibrated = false;
+  global.currentPositionPct = 0;
+  global.startPositionPct = 0;
+  global.activeFlightStartTime = 0;
+  global.switchUnseated = false;
+  global.lastCalibrationTimeOpen = 0;
+  global.lastCalibrationTimeClose = 0;
+  global.lastNVSWriteTime = 0;
+  global.hasIntermediateStop = false;
+  delete global.simulatedMillis;
+
   global.pinRelayState = 1;
   global.pinOpenSensor = 1;
   global.pinClosedSensor = 1;
@@ -449,15 +528,15 @@ console.log('====================================================\n');
   assert(global.currentState === STATE_OPENING, 'Test 8.1: updateLogic() ignores leaving sensor contact and preserves OPENING', `got ${getDebugString(global.currentState)}`);
 })();
 
-// Test 9: Movement Safety Timeout (22 Seconds)
+// Test 9: Movement Safety Timeout (27 Seconds)
 (() => {
   resetEnvironment();
   global.currentState = STATE_OPENING;
   global.previousState = STATE_CLOSED;
-  global.lastStateChangeTime = millis() - 23000; // 23 seconds ago
+  global.lastStateChangeTime = millis() - (MOVEMENT_TIMEOUT + 1000); // Exceeded movement timeout
 
   updateLogic();
-  assert(global.currentState === STATE_STOPPED, 'Test 9.1: updateLogic() forces STOPPED after 22s movement timeout', `got ${getDebugString(global.currentState)}`);
+  assert(global.currentState === STATE_STOPPED, 'Test 9.1: updateLogic() forces STOPPED after movement timeout', `got ${getDebugString(global.currentState)}`);
 })();
 
 // Test 10: Hardware Fault Protection (Dual Sensors Active)
@@ -737,10 +816,10 @@ console.log('====================================================\n');
   resetEnvironment();
   global.currentState = STATE_CLOSING;
   global.previousState = STATE_OPEN;
-  global.lastStateChangeTime = millis() - 23000; // > 22 seconds
+  global.lastStateChangeTime = millis() - (MOVEMENT_TIMEOUT + 1000); // > MOVEMENT_TIMEOUT
 
   updateLogic();
-  assert(global.currentState === STATE_STOPPED, 'Test 21.1: 22s movement timeout forces STATE_STOPPED', `got ${getDebugString(global.currentState)}`);
+  assert(global.currentState === STATE_STOPPED, 'Test 21.1: Movement timeout forces STATE_STOPPED', `got ${getDebugString(global.currentState)}`);
   assert(global.midTrackStall === true, 'Test 21.2: midTrackStall flag set', `got ${global.midTrackStall}`);
   assert(global.sensorTimeoutError === true, 'Test 21.3: sensorTimeoutError flag set', `got ${global.sensorTimeoutError}`);
 
@@ -845,6 +924,201 @@ console.log('====================================================\n');
 
   handleOn();
   assert(lastServerResponse && lastServerResponse.code === 429, 'Test 25.2: handleOn() rejects rapid flood with 429', `got ${lastServerResponse ? lastServerResponse.code : 'none'}`);
+})();
+
+// --- NEW TEST SUITE: POSITION TRACKING & FLIGHT PROGRESSION ---
+// Test 26: calculateCurrentPosition() interpolates from relay-initiated flight start time
+(() => {
+  resetEnvironment();
+  global.currentState = STATE_OPENING;
+  global.openDurationMs = 17000;
+  global.startPositionPct = 0;
+  global.activeFlightStartTime = millis();
+
+  // 26.1: Opening: Starts at 0% when relay fires
+  assert(calculateCurrentPosition() === 0, 'Test 26.1: Opening position starts at 0% upon relay trigger', `got ${calculateCurrentPosition()}`);
+
+  // 26.2: Advances halfway through flight (8500ms / 17000ms = 50%)
+  global.activeFlightStartTime = millis() - 8500;
+  assert(calculateCurrentPosition() === 50, 'Test 26.2: Opening position advances to 50% halfway through flight', `got ${calculateCurrentPosition()}`);
+
+  // 26.3: Closing: Starts at 100% when relay fires
+  global.currentState = STATE_CLOSING;
+  global.closeDurationMs = 17000;
+  global.startPositionPct = 100;
+  global.activeFlightStartTime = millis();
+  assert(calculateCurrentPosition() === 100, 'Test 26.3: Closing position starts at 100% upon relay trigger', `got ${calculateCurrentPosition()}`);
+
+  // 26.4: Closing: Halfway through flight (8500ms / 17000ms = 50%)
+  global.activeFlightStartTime = millis() - 8500;
+  assert(calculateCurrentPosition() === 50, 'Test 26.4: Closing position reduces to 50% halfway through flight', `got ${calculateCurrentPosition()}`);
+
+  // 26.5: Stopped: Returns latched currentPositionPct
+  global.currentState = STATE_STOPPED;
+  global.currentPositionPct = 42;
+  assert(calculateCurrentPosition() === 42, 'Test 26.5: Stopped door returns latched currentPositionPct', `got ${calculateCurrentPosition()}`);
+})();
+
+// --- NEW TEST SUITE: PASSIVE AUTO-CALIBRATION ---
+// Test 27: Passive calibration runs on complete natural strokes
+(() => {
+  resetEnvironment();
+  const now = 200000;
+  global.simulatedMillis = now;
+  global.currentState = STATE_OPENING;
+  global.previousState = STATE_CLOSED;
+  global.openDurationMs = 17000;
+  global.switchUnseated = true;
+  global.hasIntermediateStop = false;
+  global.activeFlightStartTime = now - 17000; // 17.0s flight to switch (+1s activation compensation = 18.0s)
+  global.isCalibrated = false;
+
+  // Door completes flight and triggers OPEN sensor
+  global.realOpenSensor = true;
+  global.realClosedSensor = false;
+  updateLogic();
+
+  // (17000 * 3 + 18000) / 4 = 69000 / 4 = 17250
+  assert(global.isCalibrated === true, 'Test 27.1: Full stroke sets isCalibrated to true', `got ${global.isCalibrated}`);
+  assert(global.openDurationMs === 17250, 'Test 27.2: openDurationMs smoothed via EMA (17250ms)', `got ${global.openDurationMs}`);
+  assert(global.lastCalibrationTimeOpen > 0, 'Test 27.3: lastCalibrationTimeOpen recorded', `got ${global.lastCalibrationTimeOpen}`);
+
+  // 27.4: Daily Lockout: Second stroke in the same day does not recalibrate
+  let previousOpenMs = global.openDurationMs;
+  global.currentState = STATE_OPENING;
+  global.previousState = STATE_CLOSED;
+  global.switchUnseated = true;
+  global.hasIntermediateStop = false;
+  global.activeFlightStartTime = now - 19000;
+  global.realOpenSensor = true;
+  updateLogic();
+  assert(global.openDurationMs === previousOpenMs, 'Test 27.4: Daily lockout prevents second calibration within 24h', `got ${global.openDurationMs}`);
+
+  // 27.5: Independent Closing Calibration
+  global.currentState = STATE_CLOSING;
+  global.previousState = STATE_OPEN;
+  global.closeDurationMs = 17000;
+  global.switchUnseated = true;
+  global.hasIntermediateStop = false;
+  global.activeFlightStartTime = now - 18000; // 18.0s flight to switch (+1s activation compensation = 19.0s)
+  global.realOpenSensor = false;
+  global.realClosedSensor = true; // hits closed switch
+  updateLogic();
+  // (17000 * 3 + 19000) / 4 = 70000 / 4 = 17500
+  assert(global.closeDurationMs === 17500, 'Test 27.5: Closing stroke independently calibrates closeDurationMs', `got ${global.closeDurationMs}`);
+  delete global.simulatedMillis;
+})();
+
+// --- NEW TEST SUITE: OUTLIER & MANUAL PAUSE REJECTION ---
+// Test 28: Rejects flights outside plausible window (<15s, >25s) or deviation > 3.5s
+(() => {
+  resetEnvironment();
+  global.openDurationMs = 17000;
+  global.isCalibrated = true;
+  global.lastCalibrationTimeOpen = 0; // ready for daily calibration
+
+  // 28.1: Too short (< 15.0s, e.g. 13.0s raw + 1.0s = 14.0s)
+  global.currentState = STATE_OPENING;
+  global.previousState = STATE_CLOSED;
+  global.switchUnseated = true;
+  global.hasIntermediateStop = false;
+  global.activeFlightStartTime = millis() - 13000;
+  global.realOpenSensor = true;
+  updateLogic();
+  assert(global.openDurationMs === 17000, 'Test 28.1: Flight < 15s discarded from calibration', `got ${global.openDurationMs}`);
+
+  // 28.2: Too long (> 25.0s, e.g. 26.0s)
+  resetEnvironment();
+  global.openDurationMs = 17000;
+  global.isCalibrated = true;
+  global.lastCalibrationTimeOpen = 0;
+  global.currentState = STATE_OPENING;
+  global.previousState = STATE_CLOSED;
+  global.switchUnseated = true;
+  global.hasIntermediateStop = false;
+  global.activeFlightStartTime = millis() - 26000;
+  global.realOpenSensor = true;
+  updateLogic();
+  assert(global.openDurationMs === 17000, 'Test 28.2: Flight > 25s discarded from calibration', `got ${global.openDurationMs}`);
+
+  // 28.3: Deviation > 3.5s from baseline (e.g. 21.0s vs 17.0s baseline = 4.0s deviation)
+  resetEnvironment();
+  global.openDurationMs = 17000;
+  global.isCalibrated = true;
+  global.lastCalibrationTimeOpen = 0;
+  global.currentState = STATE_OPENING;
+  global.previousState = STATE_CLOSED;
+  global.switchUnseated = true;
+  global.hasIntermediateStop = false;
+  global.activeFlightStartTime = millis() - 21000;
+  global.realOpenSensor = true;
+  updateLogic();
+  assert(global.openDurationMs === 17000, 'Test 28.3: Flight with >3.5s deviation from baseline discarded (manual pause)', `got ${global.openDurationMs}`);
+
+  // 28.4: Intermediate stop flag prevents calibration
+  resetEnvironment();
+  global.openDurationMs = 17000;
+  global.isCalibrated = false;
+  global.currentState = STATE_OPENING;
+  global.previousState = STATE_CLOSED;
+  global.switchUnseated = true;
+  global.hasIntermediateStop = true; // had manual stop during stroke
+  global.activeFlightStartTime = millis() - 18000;
+  global.realOpenSensor = true;
+  updateLogic();
+  assert(global.openDurationMs === 17000, 'Test 28.4: Stroke with intermediate stop discarded', `got ${global.openDurationMs}`);
+})();
+
+// --- NEW TEST SUITE: NVS WEAR PROTECTION & COOLDOWN ---
+// Test 29: NVS Flash commits only when resting at CLOSED, delta >= 200ms, and cooldown respected
+(() => {
+  resetEnvironment();
+  global.nvsStore = {};
+  global.currentState = STATE_CLOSED;
+  global.openDurationMs = 17100;
+  global.nvsStoredOpenMs = 17000; // delta 100ms (< 200ms)
+  global.lastNVSWriteTime = 0;
+
+  saveStateToNVS();
+  assert(global.nvsStore["open_ms"] === undefined, 'Test 29.1: Delta < 200ms is NOT committed to NVS', `got ${global.nvsStore["open_ms"]}`);
+
+  // Drift >= 200ms triggers write at STATE_CLOSED
+  global.openDurationMs = 17250; // delta 250ms (>= 200ms)
+  saveStateToNVS();
+  assert(global.nvsStore["open_ms"] === 17250, 'Test 29.2: Cumulative drift >= 200ms is committed to NVS', `got ${global.nvsStore["open_ms"]}`);
+  assert(global.nvsStoredOpenMs === 17250, 'Test 29.3: nvsStoredOpenMs updated in RAM', `got ${global.nvsStoredOpenMs}`);
+
+  // Immediate subsequent write is blocked by 5-minute cooldown
+  global.openDurationMs = 18000; // another delta > 200ms
+  saveStateToNVS();
+  assert(global.nvsStore["open_ms"] === 17250, 'Test 29.4: Write blocked during 5-minute cooldown', `got ${global.nvsStore["open_ms"]}`);
+
+  // STATE_STOPPED writes stop_pos
+  global.currentState = STATE_STOPPED;
+  global.currentPositionPct = 65;
+  saveStateToNVS();
+  assert(global.nvsStore["stop_pos"] === 65, 'Test 29.5: STATE_STOPPED writes stop_pos to NVS', `got ${global.nvsStore["stop_pos"]}`);
+})();
+
+// --- NEW TEST SUITE: CALIBRATE RESET ENDPOINT ---
+// Test 30: handleCalibrateReset() resets durations and clears calibration flag safely
+(() => {
+  resetEnvironment();
+  pulseLog = [];
+  global.openDurationMs = 19500;
+  global.closeDurationMs = 18800;
+  global.lastCalibrationTimeOpen = millis();
+  global.lastCalibrationTimeClose = millis();
+
+  handleCalibrateReset();
+
+  assert(global.openDurationMs === 17000, 'Test 30.1: handleCalibrateReset() resets openDurationMs to 17000', `got ${global.openDurationMs}`);
+  assert(global.closeDurationMs === 17000, 'Test 30.2: handleCalibrateReset() resets closeDurationMs to 17000', `got ${global.closeDurationMs}`);
+  assert(global.isCalibrated === false, 'Test 30.3: handleCalibrateReset() resets isCalibrated to false', `got ${global.isCalibrated}`);
+  assert(global.lastCalibrationTimeOpen === 0, 'Test 30.4: Clears open daily calibration quota', `got ${global.lastCalibrationTimeOpen}`);
+  assert(global.lastCalibrationTimeClose === 0, 'Test 30.5: Clears close daily calibration quota', `got ${global.lastCalibrationTimeClose}`);
+  assert(pulseLog.length === 0, 'Test 30.6: Zero relay pulses sent during calibration reset', `got ${pulseLog.length}`);
+  assert(lastServerResponse && lastServerResponse.code === 200, 'Test 30.7: Returns HTTP 200 OK', `got ${lastServerResponse ? lastServerResponse.code : 'none'}`);
 })();
 
 console.log('\n====================================================');

@@ -12,6 +12,8 @@ void handleOTA();
 void validateAppRollback();
 
 // Web endpoints and helpers
+bool isSameOriginRequest();
+void sendReadOnlyCORSHeaders();
 void sendCORSHeaders();
 void handleOptions();
 void handleGetState();
@@ -22,6 +24,7 @@ void handleUpdateUpload();
 void handleSetupForm();
 void handleSetupSave();
 void handleReboot();
+void handleCalibrateReset();
 #if ENABLE_ARDUINO_OTA
 void setupOTA();
 #endif

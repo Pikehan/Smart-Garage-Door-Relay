@@ -10,3 +10,8 @@
 #define WIFI_SSID_BACKUP      "YOUR_BACKUP_HOTSPOT_SSID"
 #define WIFI_PASS_BACKUP      "YOUR_BACKUP_HOTSPOT_PASSWORD"
 
+// Optional Web Authentication & AP Password Overrides
+// #define WEB_AUTH_USER      "admin"
+// #define WEB_AUTH_PASS      "YOUR_SECURE_PASSWORD"
+// #define DEFAULT_AP_PASS    "YOUR_CUSTOM_AP_PASSWORD"
+
