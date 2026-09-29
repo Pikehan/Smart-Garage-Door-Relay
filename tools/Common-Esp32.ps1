@@ -92,14 +92,14 @@ function Resolve-Esp32Credentials {
     if (-not [string]::IsNullOrWhiteSpace($WifiSsid)) {
         $escapedSsid = $WifiSsid.Replace('"', '\"')
         $escapedPass = $WifiPass.Replace('"', '\"')
-        $customFlags += "'-DWIFI_SSID_PRIMARY=\`"$escapedSsid\`"'"
-        $customFlags += "'-DWIFI_PASS_PRIMARY=\`"$escapedPass\`"'"
+        $customFlags += "`"-DWIFI_SSID_PRIMARY=\`"$escapedSsid\`"`""
+        $customFlags += "`"-DWIFI_PASS_PRIMARY=\`"$escapedPass\`"`""
     }
     if (-not [string]::IsNullOrWhiteSpace($WifiBackupSsid)) {
         $escapedBakSsid = $WifiBackupSsid.Replace('"', '\"')
         $escapedBakPass = $WifiBackupPass.Replace('"', '\"')
-        $customFlags += "'-DWIFI_SSID_BACKUP=\`"$escapedBakSsid\`"'"
-        $customFlags += "'-DWIFI_PASS_BACKUP=\`"$escapedBakPass\`"'"
+        $customFlags += "`"-DWIFI_SSID_BACKUP=\`"$escapedBakSsid\`"`""
+        $customFlags += "`"-DWIFI_PASS_BACKUP=\`"$escapedBakPass\`"`""
     }
 
     if ($customFlags.Count -gt 0) {

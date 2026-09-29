@@ -69,3 +69,7 @@ void handleToggle();
 void handleOn();
 void handleOff();
 
+void suspendSafetyTask();
+void resumeSafetyTask();
+bool isFirmwareUpdating();
+

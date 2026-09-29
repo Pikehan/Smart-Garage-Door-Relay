@@ -16,7 +16,7 @@ if (!fs.existsSync(cppPath)) {
 const cppCode = fs.readFileSync(cppPath, 'utf8');
 
 // --- SIMULATED HARDWARE ENVIRONMENT ---
-let RELAY_PIN = 2;
+let RELAY_PIN = 27;
 let OPEN_SENSOR_PIN = 25;
 let CLOSED_SENSOR_PIN = 26;
 let MOVEMENT_TIMEOUT = 27000;
@@ -259,6 +259,7 @@ function transpileBodyToJS(cppBody) {
   js = js.replace(/if\s*\(\s*doorStateMutex[\s\S]*?\}/g, '');
   js = js.replace(/xSemaphore(?:CreateRecursiveMutex|TakeRecursive|GiveRecursive)\s*\([^;]*\);?/g, '');
   js = js.replace(/doorStateMutex\s*=\s*[^;]+;/g, '');
+  js = js.replace(/millis\(\)\s*-\s*([a-zA-Z0-9_]+)/g, '((millis() - $1) >>> 0)');
   js = js.replace(/\bHIGH\b/g, '1').replace(/\bLOW\b/g, '0');
   return js;
 }
@@ -271,10 +272,46 @@ function extractFunctionBody(code, funcName) {
   let startIndex = match.index + match[0].length - 1;
   let depth = 0;
   let endIndex = -1;
+  let inString = false;
+  let stringChar = '';
+  let inLineComment = false;
+  let inBlockComment = false;
 
   for (let i = startIndex; i < code.length; i++) {
-    if (code[i] === '{') depth++;
-    else if (code[i] === '}') {
+    const c = code[i];
+    const prev = (i > startIndex) ? code[i - 1] : '';
+
+    if (inLineComment) {
+      if (c === '\n') inLineComment = false;
+      continue;
+    }
+    if (inBlockComment) {
+      if (c === '/' && prev === '*') inBlockComment = false;
+      continue;
+    }
+    if (inString) {
+      if (c === stringChar && prev !== '\\') inString = false;
+      continue;
+    }
+
+    if (c === '/' && i + 1 < code.length && code[i + 1] === '/') {
+      inLineComment = true;
+      i++;
+      continue;
+    }
+    if (c === '/' && i + 1 < code.length && code[i + 1] === '*') {
+      inBlockComment = true;
+      i++;
+      continue;
+    }
+    if (c === '"' || c === "'") {
+      inString = true;
+      stringChar = c;
+      continue;
+    }
+
+    if (c === '{') depth++;
+    else if (c === '}') {
       depth--;
       if (depth === 0) {
         endIndex = i;
@@ -309,6 +346,7 @@ global.handleCalibrateReset = function() { return fnHandleCalibrateReset(); };
 global.saveStateToNVS = function() { fnSaveStateToNVS(); };
 global.releaseRelayIfExpired = function() { fnReleaseRelayIfExpired(); };
 global.isSameOriginRequest = function() { return true; };
+global.isFirmwareUpdating = function() { return false; };
 
 const fnTriggerRelay = compileFunc('triggerRelay');
 const fnHandleRelay = compileFunc('handleRelay');
@@ -1119,6 +1157,61 @@ console.log('====================================================\n');
   assert(global.lastCalibrationTimeClose === 0, 'Test 30.5: Clears close daily calibration quota', `got ${global.lastCalibrationTimeClose}`);
   assert(pulseLog.length === 0, 'Test 30.6: Zero relay pulses sent during calibration reset', `got ${pulseLog.length}`);
   assert(lastServerResponse && lastServerResponse.code === 200, 'Test 30.7: Returns HTTP 200 OK', `got ${lastServerResponse ? lastServerResponse.code : 'none'}`);
+})();
+
+// Test 31: 32-bit unsigned millis() rollover (~49.7 days) does not disrupt timing or trigger lockout
+(() => {
+  resetEnvironment();
+  pulseLog = [];
+  global.currentState = STATE_CLOSED;
+  global.previousState = STATE_CLOSED;
+
+  // Set clock right before 32-bit rollover (0xFFFFFFFF = 4294967295)
+  global.simulatedMillis = 4294967290;
+  handleToggle();
+
+  assert(pulseLog.length === 1, 'Test 31.1: Pulse fired before rollover', `got ${pulseLog.length}`);
+  assert(global.lastPulseTime === 4294967290, 'Test 31.2: lastPulseTime recorded near 0xFFFFFFFF', `got ${global.lastPulseTime}`);
+
+  // Advance time past 0xFFFFFFFF into rollover window (+100ms past rollover)
+  global.simulatedMillis = 94; // Total elapsed: (4294967295 - 4294967290) + 1 + 94 = 100ms
+  handleToggle(); // Should be rejected by COMMAND_LOCKOUT_MS (1500ms)
+  assert(pulseLog.length === 1, 'Test 31.3: Command rejected during 1500ms lockout across rollover', `got ${pulseLog.length}`);
+  assert(lastServerResponse && lastServerResponse.code === 429, 'Test 31.4: Returns 429 Too Many Requests across rollover', `got ${lastServerResponse ? lastServerResponse.code : 'none'}`);
+
+  // Advance time past lockout window (+2000ms past pulse)
+  global.simulatedMillis = 1994; // Total elapsed: 2000ms > 1500ms lockout
+  handleRelay(); // Release active relay pulse (200ms duration)
+  handleToggle(); // Should now be accepted
+  assert(pulseLog.length === 2, 'Test 31.5: Command accepted once lockout expires past rollover', `got ${pulseLog.length}`);
+  assert(lastServerResponse && lastServerResponse.code === 200, 'Test 31.6: Returns 200 OK after rollover', `got ${lastServerResponse ? lastServerResponse.code : 'none'}`);
+})();
+
+// Test 32: Commands locked out during OTA firmware update (isFirmwareUpdating() == true)
+(() => {
+  resetEnvironment();
+  pulseLog = [];
+  global.currentState = STATE_CLOSED;
+  global.previousState = STATE_CLOSED;
+
+  global.isFirmwareUpdating = () => true;
+
+  handleToggle();
+  assert(lastServerResponse && lastServerResponse.code === 409, 'Test 32.1: handleToggle() returns 409 during OTA', `got ${lastServerResponse ? lastServerResponse.code : 'none'}`);
+  assert(pulseLog.length === 0, 'Test 32.2: Zero pulses fired on handleToggle() during OTA', `got ${pulseLog.length}`);
+
+  handleOn();
+  assert(lastServerResponse && lastServerResponse.code === 409, 'Test 32.3: handleOn() returns 409 during OTA', `got ${lastServerResponse ? lastServerResponse.code : 'none'}`);
+  assert(pulseLog.length === 0, 'Test 32.4: Zero pulses fired on handleOn() during OTA', `got ${pulseLog.length}`);
+
+  handleOff();
+  assert(lastServerResponse && lastServerResponse.code === 409, 'Test 32.5: handleOff() returns 409 during OTA', `got ${lastServerResponse ? lastServerResponse.code : 'none'}`);
+  assert(pulseLog.length === 0, 'Test 32.6: Zero pulses fired on handleOff() during OTA', `got ${pulseLog.length}`);
+
+  handleCalibrateReset();
+  assert(lastServerResponse && lastServerResponse.code === 409, 'Test 32.7: handleCalibrateReset() returns 409 during OTA', `got ${lastServerResponse ? lastServerResponse.code : 'none'}`);
+
+  global.isFirmwareUpdating = () => false;
 })();
 
 console.log('\n====================================================');

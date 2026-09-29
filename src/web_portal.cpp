@@ -36,16 +36,6 @@ void handleOptions() {
   server.send(204, "text/plain", "");
 }
 
-static bool checkWebAuth() {
-#if ENABLE_WEB_AUTH
-  if (!server.authenticate(WEB_AUTH_USER, WEB_AUTH_PASS)) {
-    server.requestAuthentication();
-    return false;
-  }
-#endif
-  return true;
-}
-
 bool isSameOriginRequest() {
   String target = server.hasHeader("Origin") ? server.header("Origin") : (server.hasHeader("Referer") ? server.header("Referer") : "");
   if (target.length() == 0) return true;
@@ -59,13 +49,8 @@ bool isSameOriginRequest() {
   int portIdx = host.indexOf(':');
   if (portIdx != -1) host = host.substring(0, portIdx);
 
-  // Exact hostname equality checks
-  String srvHost = server.hostHeader();
-  int srvPortIdx = srvHost.indexOf(':');
-  if (srvPortIdx != -1) srvHost = srvHost.substring(0, srvPortIdx);
-
-  if (host.equalsIgnoreCase(srvHost) ||
-      host.equalsIgnoreCase(DEVICE_HOSTNAME) ||
+  // Strict identity checks to prevent DNS rebinding attacks
+  if (host.equalsIgnoreCase(DEVICE_HOSTNAME) ||
       host.equalsIgnoreCase(String(DEVICE_HOSTNAME) + ".local") ||
       host == WiFi.localIP().toString() ||
       host == WiFi.softAPIP().toString() ||
@@ -100,10 +85,16 @@ void saveWiFiCredentials(const char* ssidPri, const char* passPri, const char* s
   if (ssidBak && strlen(ssidBak) > 0) {
     wifiPrefs.putString("ssid_bak", ssidBak);
     activeSsidBackup = String(ssidBak);
+  } else {
+    wifiPrefs.remove("ssid_bak");
+    activeSsidBackup = "";
   }
-  if (passBak) {
+  if (passBak && strlen(passBak) > 0) {
     wifiPrefs.putString("pass_bak", passBak);
     activePassBackup = String(passBak);
+  } else {
+    wifiPrefs.remove("pass_bak");
+    activePassBackup = "";
   }
   wifiPrefs.end();
   Serial.println("[WiFi] Credentials committed to NVS Flash.");
@@ -150,9 +141,13 @@ static void triggerWiFiConnect() {
       }
     }
     if (currentNetwork == 1) {
+#if ENABLE_STATIC_IP
       if (!WiFi.config(LOCAL_IP, GATEWAY, SUBNET, PRIMARY_DNS, SECONDARY_DNS)) {
         Serial.println("[WiFi] Failed to configure Static IP");
       }
+#else
+      WiFi.config(INADDR_NONE, INADDR_NONE, INADDR_NONE);
+#endif
       Serial.print("[WiFi] Connecting to Primary Wi-Fi: ");
       Serial.println(activeSsidPrimary);
       WiFi.begin(activeSsidPrimary.c_str(), activePassPrimary.c_str());
@@ -164,7 +159,7 @@ static void triggerWiFiConnect() {
       currentNetwork = 1;
       return;
     }
-    WiFi.config(IPAddress(0, 0, 0, 0), IPAddress(0, 0, 0, 0), IPAddress(0, 0, 0, 0));
+    WiFi.config(INADDR_NONE, INADDR_NONE, INADDR_NONE);
     Serial.print("[WiFi] Connecting to Backup Wi-Fi: ");
     Serial.println(activeSsidBackup);
     WiFi.begin(activeSsidBackup.c_str(), activePassBackup.c_str());
@@ -176,13 +171,14 @@ void initWiFi() {
   WiFi.mode(WIFI_STA);
   WiFi.onEvent(onWiFiEvent);
 
-  // Persist compile-time credentials if supplied
-  if (strlen(WIFI_SSID_PRIMARY) > 0) {
-    saveWiFiCredentials(WIFI_SSID_PRIMARY, WIFI_PASS_PRIMARY, WIFI_SSID_BACKUP, WIFI_PASS_BACKUP);
-  }
-
   // Load credentials from flash; start setup AP if none exist
   bool hasCredentials = loadWiFiCredentials(activeSsidPrimary, activePassPrimary, activeSsidBackup, activePassBackup);
+
+  // Only seed compile-time credentials if NVS is empty
+  if (!hasCredentials && strlen(WIFI_SSID_PRIMARY) > 0) {
+    saveWiFiCredentials(WIFI_SSID_PRIMARY, WIFI_PASS_PRIMARY, WIFI_SSID_BACKUP, WIFI_PASS_BACKUP);
+    hasCredentials = loadWiFiCredentials(activeSsidPrimary, activePassPrimary, activeSsidBackup, activePassBackup);
+  }
 
   if (!hasCredentials) {
     Serial.println("[WiFi] No Wi-Fi credentials in NVS. Starting emergency setup AP...");
@@ -206,12 +202,27 @@ void initWiFi() {
   }
 }
 
+static unsigned long wifiOfflineStartTime = 0;
+
 void handleWiFiReconnection() {
   if (mdnsPending && wifiConnected) {
     mdnsPending = false;
     if (MDNS.begin(DEVICE_HOSTNAME)) {
       MDNS.addService("http", "tcp", 80);
       Serial.printf("[mDNS] Responder active: http://%s.local\n", DEVICE_HOSTNAME);
+    }
+  }
+
+  if (wifiConnected) {
+    wifiOfflineStartTime = 0;
+  } else {
+    if (wifiOfflineStartTime == 0) {
+      wifiOfflineStartTime = millis();
+    }
+    // Fallback to emergency SoftAP if unable to connect for > 60 seconds
+    if (!apModeActive && (millis() - wifiOfflineStartTime >= 60000UL)) {
+      Serial.println("[WiFi] Reconnection failed for >60s. Starting emergency SoftAP portal...");
+      startSoftAPPortal();
     }
   }
 
@@ -233,16 +244,27 @@ void handleWiFiReconnection() {
   }
 }
 
-// Confirm partition health to cancel rollback
+// Confirm partition health to cancel rollback after stability window
 void validateAppRollback() {
+  static bool validated = false;
+  if (validated) return;
+
   const esp_partition_t *running = esp_ota_get_running_partition();
   esp_ota_img_states_t ota_state;
   if (esp_ota_get_state_partition(running, &ota_state) == ESP_OK) {
     if (ota_state == ESP_OTA_IMG_PENDING_VERIFY) {
+      if (!wifiConnected && millis() > 180000UL) {
+        Serial.println("[OTA] Critical: Wi-Fi unreachable after 3 minutes. Rolling back firmware!");
+        esp_ota_mark_app_invalid_rollback_and_reboot();
+        return;
+      }
+      if (millis() < 30000 || !wifiConnected) return;
+
       esp_ota_mark_app_valid_cancel_rollback();
-      Serial.println("[OTA] Firmware self-check passed: App marked valid, rollback cancelled.");
+      Serial.println("[OTA] Firmware self-check passed: 30s runtime & Wi-Fi stable. Rollback cancelled.");
     }
   }
+  validated = true;
 }
 
 void handleGetState() {
@@ -529,7 +551,7 @@ header{display:flex;flex-wrap:wrap;justify-content:space-between;align-items:cen
       <div class="quick-info">
         <span>ArduinoOTA Port: <strong>3232</strong></span>
         <span>mDNS: <strong>garage-door.local</strong></span>
-        <span>Relay Pin: <strong>GPIO 2</strong></span>
+        <span>Relay Pin: <strong>GPIO 27</strong></span>
       </div>
     </div>
 
@@ -1002,7 +1024,14 @@ void handleReboot() {
     server.send(403, "application/json", "{\"status\":\"error\",\"message\":\"Cross-origin request forbidden\"}");
     return;
   }
-  if (!checkWebAuth()) return;
+  if (isFirmwareUpdating()) {
+    server.send(409, "application/json", "{\"status\":\"error\",\"message\":\"Firmware update in progress. Reboot locked.\"}");
+    return;
+  }
+  if (currentState == STATE_OPENING || currentState == STATE_CLOSING) {
+    server.send(409, "application/json", "{\"status\":\"error\",\"message\":\"Door is in motion. Reboot locked for safety.\"}");
+    return;
+  }
   server.send(200, "application/json", "{\"status\":\"success\",\"message\":\"Rebooting ESP32 controller...\"}");
   delay(1000);
   ESP.restart();
@@ -1044,7 +1073,6 @@ button:hover{background:#0369a1}
 </div></body></html>)rawliteral";
 
 void handleSetupForm() {
-  if (wifiConnected && !checkWebAuth()) return;
   server.send_P(200, "text/html", SETUP_PAGE_HTML);
 }
 
@@ -1053,7 +1081,14 @@ void handleSetupSave() {
     server.send(403, "application/json", "{\"status\":\"error\",\"message\":\"Cross-origin request forbidden\"}");
     return;
   }
-  if (wifiConnected && !checkWebAuth()) return;
+  if (isFirmwareUpdating()) {
+    server.send(409, "application/json", "{\"status\":\"error\",\"message\":\"Firmware update in progress. Setup locked.\"}");
+    return;
+  }
+  if (currentState == STATE_OPENING || currentState == STATE_CLOSING) {
+    server.send(409, "application/json", "{\"status\":\"error\",\"message\":\"Door is in motion. Setup locked for safety.\"}");
+    return;
+  }
 
   String newSsid = server.arg("ssid");
   String newPass = server.arg("pass");
@@ -1078,11 +1113,17 @@ void handleSetupSave() {
 }
 
 void handleUpdateForm() {
-  if (!checkWebAuth()) return;
-
+  if (isFirmwareUpdating()) {
+    server.send(409, "text/plain", "409 Conflict: Firmware update already in progress.");
+    return;
+  }
   // Do not serve update form while door is in motion
   {
     DoorStateLock lock;
+    if (!lock.acquired) {
+      server.send(503, "text/plain", "503 Busy: State lock acquisition timeout.");
+      return;
+    }
     if (currentState == STATE_OPENING || currentState == STATE_CLOSING) {
       server.send(409, "text/plain", "409 Conflict: Door is moving. Firmware update is locked for physical safety.");
       return;
@@ -1174,47 +1215,98 @@ void handleUpdateForm() {
   server.send_P(200, "text/html", (const char*)UPDATE_PAGE_GZ, UPDATE_PAGE_GZ_LEN);
 }
 
-void handleUpdateUpload() {
-  if (!checkWebAuth()) {
-    Update.abort();
-    return;
-  }
+static const char* webOtaError = nullptr;
+static bool webOtaSuspended = false;
+static bool arduinoOtaActive = false;
 
-  // Prevent firmware writes while door is in motion
-  {
-    DoorStateLock lock;
-    if (currentState == STATE_OPENING || currentState == STATE_CLOSING) {
+void handleUpdateUpload() {
+  HTTPUpload& upload = server.upload();
+
+  if (upload.status == UPLOAD_FILE_START) {
+    webOtaError = nullptr;
+
+    if (!isSameOriginRequest()) {
+      webOtaError = "Cross-origin request forbidden";
       Update.abort();
-      server.send(409, "text/plain", "Door in motion. Update aborted.");
       return;
     }
-  }
 
-  // Check available heap before starting update
-  if (ESP.getMaxAllocHeap() < 20000) {
-    Update.abort();
-    server.send(503, "text/plain", "Low Memory: Reboot before update.");
-    return;
-  }
+    if (isFirmwareUpdating() || arduinoOtaActive) {
+      webOtaError = "Firmware update already in progress";
+      Update.abort();
+      return;
+    }
 
-  HTTPUpload& upload = server.upload();
-  if (upload.status == UPLOAD_FILE_START) {
+    // Prevent firmware writes while door is in motion
+    {
+      DoorStateLock lock;
+      if (!lock.acquired) {
+        webOtaError = "State lock acquisition timeout";
+        Update.abort();
+        return;
+      }
+      if (currentState == STATE_OPENING || currentState == STATE_CLOSING) {
+        webOtaError = "Door in motion. Update aborted.";
+        Update.abort();
+        return;
+      }
+    }
+
+    // Check available heap before starting update
+    if (ESP.getMaxAllocHeap() < 20000) {
+      webOtaError = "Low Memory: Reboot before update.";
+      Update.abort();
+      return;
+    }
+
     Serial.printf("\n[WebOTA] Update file receiving: %s\n", upload.filename.c_str());
+    if (!webOtaSuspended) {
+      suspendSafetyTask();
+      webOtaSuspended = true;
+    }
     if (!Update.begin(UPDATE_SIZE_UNKNOWN)) {
       Update.printError(Serial);
+      webOtaError = "Update.begin failed";
+      resumeSafetyTask();
+      webOtaSuspended = false;
+    }
+    if (server.hasHeader("x-MD5")) {
+      String expectedMD5 = server.header("x-MD5");
+      expectedMD5.trim();
+      if (expectedMD5.length() == 32) {
+        Update.setMD5(expectedMD5.c_str());
+        Serial.printf("[WebOTA] Enforcing MD5 checksum verification: %s\n", expectedMD5.c_str());
+      }
     }
   } else if (upload.status == UPLOAD_FILE_WRITE) {
+    if (webOtaError != nullptr) return;
     if (Update.write(upload.buf, upload.currentSize) != upload.currentSize) {
       Update.printError(Serial);
+      webOtaError = "Flash write failed";
+      Update.abort();
+      if (webOtaSuspended) {
+        resumeSafetyTask();
+        webOtaSuspended = false;
+      }
     }
   } else if (upload.status == UPLOAD_FILE_END) {
+    if (webOtaError != nullptr) return;
     if (Update.end(true)) {
       Serial.printf("[WebOTA] Update successfully completed! Total bytes: %u\n", upload.totalSize);
     } else {
       Update.printError(Serial);
+      webOtaError = "Update.end verification failed";
+      if (webOtaSuspended) {
+        resumeSafetyTask();
+        webOtaSuspended = false;
+      }
     }
   } else if (upload.status == UPLOAD_FILE_ABORTED) {
     Update.abort();
+    if (webOtaSuspended) {
+      resumeSafetyTask();
+      webOtaSuspended = false;
+    }
     Serial.println("\n[WebOTA] Update aborted by client!");
   }
 }
@@ -1223,20 +1315,32 @@ void handleUpdateUpload() {
 void setupOTA() {
   ArduinoOTA.setHostname(DEVICE_HOSTNAME);
   ArduinoOTA.onStart([]() {
-    // Prevent OTA update while door is in motion
-    if (currentState == STATE_OPENING || currentState == STATE_CLOSING) {
-      Serial.println("\n[ArduinoOTA] Rejected: Door is in motion!");
+    // Prevent OTA update while door is in motion or if an update is already running
+    if (currentState == STATE_OPENING || currentState == STATE_CLOSING || isFirmwareUpdating()) {
+      Serial.println("\n[ArduinoOTA] Rejected: Door is in motion or update in progress!");
+      Update.begin(1); // Force internal Update.begin() inside ArduinoOTA to fail with "already running" -> OTA_BEGIN_ERROR
       return;
     }
+    arduinoOtaActive = true;
+    suspendSafetyTask();
     Serial.println("\n[ArduinoOTA] Wireless firmware update starting...");
   });
   ArduinoOTA.onEnd([]() {
+    arduinoOtaActive = false;
+    resumeSafetyTask();
     Serial.println("\n[ArduinoOTA] Wireless firmware update complete!");
   });
   ArduinoOTA.onProgress([](unsigned int progress, unsigned int total) {
-    Serial.printf("[ArduinoOTA] Progress: %u%%\r", (progress / (total / 100)));
+    if (total > 0) {
+      Serial.printf("[ArduinoOTA] Progress: %u%%\r", (progress * 100) / total);
+    }
   });
   ArduinoOTA.onError([](ota_error_t error) {
+    if (arduinoOtaActive) {
+      arduinoOtaActive = false;
+      Update.abort();
+      resumeSafetyTask();
+    }
     Serial.printf("[ArduinoOTA] Error[%u]: ", error);
     if (error == OTA_AUTH_ERROR) Serial.println("Auth Failed");
     else if (error == OTA_BEGIN_ERROR) Serial.println("Begin Failed");
@@ -1250,8 +1354,8 @@ void setupOTA() {
 #endif
 
 void initWebPortal() {
-  const char* headerkeys[] = {"Origin", "Referer"};
-  server.collectHeaders(headerkeys, 2);
+  const char* headerkeys[] = {"Origin", "Referer", "x-MD5"};
+  server.collectHeaders(headerkeys, 3);
 
   server.on("/", HTTP_GET, handleRoot);
   server.on("/", HTTP_OPTIONS, handleOptions);
@@ -1265,19 +1369,44 @@ void initWebPortal() {
 
   server.on("/update", HTTP_GET, handleUpdateForm);
   server.on("/update", HTTP_POST, []() {
-    if (!checkWebAuth()) return;
+    if (!isSameOriginRequest()) {
+      if (webOtaSuspended) {
+        resumeSafetyTask();
+        webOtaSuspended = false;
+      }
+      server.send(403, "application/json", "{\"status\":\"error\",\"message\":\"Cross-origin request forbidden\"}");
+      return;
+    }
     {
       DoorStateLock lock;
+      if (!lock.acquired) {
+        if (webOtaSuspended) {
+          resumeSafetyTask();
+          webOtaSuspended = false;
+        }
+        server.send(503, "application/json", "{\"status\":\"error\",\"message\":\"State lock acquisition timeout\"}");
+        return;
+      }
       if (currentState == STATE_OPENING || currentState == STATE_CLOSING) {
+        if (webOtaSuspended) {
+          resumeSafetyTask();
+          webOtaSuspended = false;
+        }
         server.send(409, "application/json", "{\"status\":\"error\",\"message\":\"Door is in motion. Update locked for safety.\"}");
         return;
       }
     }
-    bool hasError = Update.hasError();
-    server.send(200, "application/json", hasError ?
-      "{\"status\":\"error\",\"message\":\"Firmware update failed!\"}" :
-      "{\"status\":\"success\",\"message\":\"Firmware updated successfully! Rebooting ESP32...\"}");
-    if (!hasError) {
+    bool hasError = Update.hasError() || (webOtaError != nullptr);
+    if (hasError) {
+      if (webOtaSuspended) {
+        resumeSafetyTask();
+        webOtaSuspended = false;
+      }
+      String errMsg = webOtaError ? String(webOtaError) : "Firmware update failed!";
+      webOtaError = nullptr;
+      server.send(500, "application/json", String("{\"status\":\"error\",\"message\":\"") + errMsg + "\"}");
+    } else {
+      server.send(200, "application/json", "{\"status\":\"success\",\"message\":\"Firmware updated successfully! Rebooting ESP32...\"}");
       delay(1000);
       ESP.restart();
     }
@@ -1304,7 +1433,11 @@ void handleWebClients() {
 
 void handleOTA() {
 #if ENABLE_ARDUINO_OTA
-  if (currentState != STATE_OPENING && currentState != STATE_CLOSING) {
+  // Never service ArduinoOTA while WebOTA is actively flashing
+  if (webOtaSuspended) {
+    return;
+  }
+  if (arduinoOtaActive || (currentState != STATE_OPENING && currentState != STATE_CLOSING)) {
     ArduinoOTA.handle();
   }
 #endif

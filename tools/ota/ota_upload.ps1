@@ -36,55 +36,57 @@ Resolve-Esp32Credentials -ProjectRoot $projectRoot `
 # 3. Locate PlatformIO
 $pio = Get-PlatformIOExecutable
 
-# 4. Compile ESP32 firmware binary
-Write-Host "`n[1/3] Compiling ESP32 firmware binary..." -ForegroundColor Yellow
 Push-Location $projectRoot
 try {
+    # 4. Compile ESP32 firmware binary
+    Write-Host "`n[1/3] Compiling ESP32 firmware binary..." -ForegroundColor Yellow
     & $pio run -e esp32dev
     if ($LASTEXITCODE -ne 0) {
         Write-Host "`nBuild failed! Aborting upload." -ForegroundColor Red
         exit 1
     }
-} finally {
-    Clear-Esp32BuildFlags
-    Pop-Location
-}
 
-# 5. Export and verify binary size for OTA partition
-$exported = Export-Esp32FirmwareBinary -ProjectRoot $projectRoot
-$destBin = $exported.Path
-Write-Host "`nFirmware binary updated: $destBin ($($exported.SizeKb) KB)" -ForegroundColor Green
+    # 5. Export and verify binary size for OTA partition
+    $exported = Export-Esp32FirmwareBinary -ProjectRoot $projectRoot
+    $destBin = $exported.Path
+    Write-Host "`nFirmware binary updated: $destBin ($($exported.SizeKb) KB)" -ForegroundColor Green
 
-# Sanity check: Ensure binary fits within target OTA partition (0x1E0000 / ~1.9 MB)
-Assert-OtaBinarySize -BinaryPath $destBin
+    # Sanity check: Ensure binary fits within target OTA partition (0x1E0000 / ~1.9 MB)
+    Assert-OtaBinarySize -BinaryPath $destBin
 
-# 6. Upload via HTTP Web OTA endpoint
-Write-Host "`n[2/3] Uploading firmware to ESP32 (http://${IpAddress}/update)..." -ForegroundColor Yellow
+    # Calculate MD5 checksum for end-to-end payload verification
+    $md5Hash = (Get-FileHash -Path $destBin -Algorithm MD5).Hash.ToLower()
+    Write-Host "Firmware MD5: $md5Hash" -ForegroundColor Gray
 
-$uploadSuccess = $false
-try {
-    $uri = "http://${IpAddress}/update"
-    $response = & curl.exe -s -S --fail --connect-timeout 6 --max-time 60 -F "update=@$destBin" $uri 2>&1
-    
-    if ($LASTEXITCODE -eq 0 -and $response -match "success") {
-        Write-Host "Web OTA Upload Successful! Response: $response" -ForegroundColor Green
-        $uploadSuccess = $true
-    } else {
-        Write-Host "Web OTA response / error: $response" -ForegroundColor Yellow
+    # 6. Upload via HTTP Web OTA endpoint
+    Write-Host "`n[2/3] Uploading firmware to ESP32 (http://${IpAddress}/update)..." -ForegroundColor Yellow
+
+    $uploadSuccess = $false
+    try {
+        $uri = "http://${IpAddress}/update"
+        $response = & curl.exe -s -S --fail --connect-timeout 6 --max-time 60 -H "x-MD5: $md5Hash" -F "update=@$destBin" $uri 2>&1
+        
+        if ($LASTEXITCODE -eq 0 -and $response -match "success") {
+            Write-Host "Web OTA Upload Successful! Response: $response" -ForegroundColor Green
+            $uploadSuccess = $true
+        } else {
+            Write-Host "Web OTA response / error: $response" -ForegroundColor Yellow
+            if ($response -match "409" -or $response -match "motion") {
+                Write-Host "`nUpload aborted: Door is currently moving. Firmware update is locked for physical safety." -ForegroundColor Red
+                exit 1
+            }
+        }
+    } catch {
+        Write-Host "HTTP OTA request to http://${IpAddress}/update failed: $_" -ForegroundColor Yellow
     }
-} catch {
-    Write-Host "HTTP OTA request to http://${IpAddress}/update failed: $_" -ForegroundColor Yellow
-}
 
-if ($uploadSuccess) {
-    Write-Host "`n[3/3] ESP32 is rebooting with new firmware!" -ForegroundColor Cyan
-    exit 0
-}
+    if ($uploadSuccess) {
+        Write-Host "`n[3/3] ESP32 is rebooting with new firmware!" -ForegroundColor Cyan
+        exit 0
+    }
 
-# 7. Fallback to ArduinoOTA wireless upload
-Write-Host "`n[3/3] Trying ArduinoOTA wireless upload..." -ForegroundColor Yellow
-Push-Location $projectRoot
-try {
+    # 7. Fallback to ArduinoOTA wireless upload
+    Write-Host "`n[3/3] Trying ArduinoOTA wireless upload..." -ForegroundColor Yellow
     & $pio run -t upload -e esp32dev_ota --upload-port $IpAddress
     if ($LASTEXITCODE -eq 0) {
         Write-Host "`nArduinoOTA Upload Successful!" -ForegroundColor Green
@@ -93,5 +95,6 @@ try {
         exit 1
     }
 } finally {
+    Clear-Esp32BuildFlags
     Pop-Location
 }

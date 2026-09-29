@@ -258,26 +258,32 @@ void handleCalibrateReset() {
     server.send(403, "application/json", "{\"status\":\"error\", \"message\":\"Cross-origin request forbidden\"}");
     return;
   }
-  DoorStateLock lock;
-  if (!lock.acquired) {
-    server.send(503, "application/json", "{\"status\":\"error\", \"message\":\"Door controller busy\"}");
+  if (isFirmwareUpdating()) {
+    server.send(409, "application/json", "{\"status\":\"error\", \"message\":\"Firmware update in progress. Controls locked.\"}");
     return;
   }
+  {
+    DoorStateLock lock;
+    if (!lock.acquired) {
+      server.send(503, "application/json", "{\"status\":\"error\", \"message\":\"Door controller busy\"}");
+      return;
+    }
 
-  openDurationMs = DEFAULT_OPEN_DURATION_MS;
-  closeDurationMs = DEFAULT_CLOSE_DURATION_MS;
-  nvsStoredOpenMs = DEFAULT_OPEN_DURATION_MS;
-  nvsStoredCloseMs = DEFAULT_CLOSE_DURATION_MS;
-  isCalibrated = false;
-  lastCalibrationTimeOpen = 0;
-  lastCalibrationTimeClose = 0;
+    openDurationMs = DEFAULT_OPEN_DURATION_MS;
+    closeDurationMs = DEFAULT_CLOSE_DURATION_MS;
+    nvsStoredOpenMs = DEFAULT_OPEN_DURATION_MS;
+    nvsStoredCloseMs = DEFAULT_CLOSE_DURATION_MS;
+    isCalibrated = false;
+    lastCalibrationTimeOpen = 0;
+    lastCalibrationTimeClose = 0;
 
-  Preferences prefs;
-  prefs.begin("garage", false);
-  prefs.putUInt("open_ms", (uint32_t)DEFAULT_OPEN_DURATION_MS);
-  prefs.putUInt("close_ms", (uint32_t)DEFAULT_CLOSE_DURATION_MS);
-  prefs.putBool("cal_done", false);
-  prefs.end();
+    Preferences prefs;
+    prefs.begin("garage", false);
+    prefs.putUInt("open_ms", (uint32_t)DEFAULT_OPEN_DURATION_MS);
+    prefs.putUInt("close_ms", (uint32_t)DEFAULT_CLOSE_DURATION_MS);
+    prefs.putBool("cal_done", false);
+    prefs.end();
+  }
 
   Serial.println("ACTION: Calibration reset to defaults (17.0s) & daily quota cleared.");
   server.send(200, "application/json", "{\"status\":\"success\", \"message\":\"Calibration and daily quota reset! Next flight will re-calibrate immediately.\"}");
@@ -342,107 +348,119 @@ void handleToggle() {
     server.send(403, "application/json", "{\"status\":\"error\", \"message\":\"Cross-origin request forbidden\"}");
     return;
   }
-  DoorStateLock lock;
-  if (!lock.acquired) {
-    server.send(503, "application/json", "{\"status\":\"error\", \"message\":\"Door controller busy\"}");
+  if (isFirmwareUpdating()) {
+    server.send(409, "application/json", "{\"status\":\"error\", \"message\":\"Firmware update in progress. Controls locked.\"}");
     return;
   }
 
-  // Cancel pending multi-pulse sequence
-  if (pendingState != STATE_UNKNOWN) {
-    bool motorMoving = (pendingPulsesCount == 2);
-    pendingState = STATE_UNKNOWN;
-    pendingPulsesCount = 0;
-    currentState = STATE_STOPPED;
-    lastStateChangeTime = millis();
-    saveStateToNVS();
-    if (motorMoving) {
-      triggerRelay();
+  int httpCode = 200;
+  const char* responseJson = "{\"status\":\"success\", \"message\":\"Relay triggered\"}";
+
+  {
+    DoorStateLock lock;
+    if (!lock.acquired) {
+      server.send(503, "application/json", "{\"status\":\"error\", \"message\":\"Door controller busy\"}");
+      return;
     }
-    clearFaultFlags();
-    server.send(200, "application/json", "{\"status\":\"success\", \"message\":\"Cancelled pending movement. Door remains stopped.\"}");
-    return;
-  }
 
-  // Rate limit rapid triggers
-  if (lastPulseTime > 0 && (millis() - lastPulseTime < COMMAND_LOCKOUT_MS)) {
-    server.send(429, "application/json", "{\"status\":\"error\", \"message\":\"Command rate limit: Please wait 1.5s between triggers.\"}");
-    return;
-  }
-
-  clearFaultFlags();
-
-  if (relayActive) {
-    server.send(429, "application/json", "{\"status\":\"error\", \"message\":\"Relay is actively pressing. Please wait.\"}");
-    return;
-  }
-
-  // Verify sensor disengages after pulsing
-  if (currentState == STATE_CLOSED || currentState == STATE_OPEN) {
-    pulseVerificationPending = true;
-    pulseOriginState = currentState;
-  } else {
-    pulseVerificationPending = false;
-  }
-
-  // Pulse relay (wall button toggle behavior)
-  triggerRelay();
-
-  DoorState nextState = currentState;
-
-  if (currentState == STATE_OPENING || currentState == STATE_CLOSING) {
-    nextState = STATE_STOPPED;
-    currentPositionPct = calculateCurrentPosition();
-    startPositionPct = currentPositionPct;
-    hasIntermediateStop = true;
-    switchUnseated = false;
-  }
-  else if (currentState == STATE_STOPPED || currentState == STATE_UNKNOWN) {
-    startPositionPct = currentPositionPct;
-    hasIntermediateStop = true;
-    switchUnseated = true;
-    activeFlightStartTime = millis();
-
-    if (realClosedSensor && realOpenSensor) {
-      // Sensor fault: alternate direction
-      lastCommandedDirection = (lastCommandedDirection == STATE_OPENING) ? STATE_CLOSING : STATE_OPENING;
-      nextState = lastCommandedDirection;
+    // Cancel pending multi-pulse sequence
+    if (pendingState != STATE_UNKNOWN) {
+      bool motorMoving = (pendingPulsesCount == 2);
+      pendingState = STATE_UNKNOWN;
+      pendingPulsesCount = 0;
+      currentState = STATE_STOPPED;
+      lastStateChangeTime = millis();
+      saveStateToNVS();
+      if (motorMoving) {
+        triggerRelay();
+      }
+      clearFaultFlags();
+      httpCode = 200;
+      responseJson = "{\"status\":\"success\", \"message\":\"Cancelled pending movement. Door remains stopped.\"}";
     }
-    else if (previousState == STATE_OPENING) nextState = STATE_CLOSING;
-    else if (previousState == STATE_CLOSING) nextState = STATE_OPENING;
-    else if (previousState == STATE_CLOSED) nextState = STATE_OPENING;
-    else if (previousState == STATE_OPEN) nextState = STATE_CLOSING;
+    // Rate limit rapid triggers
+    else if (lastPulseTime > 0 && (millis() - lastPulseTime < COMMAND_LOCKOUT_MS)) {
+      httpCode = 429;
+      responseJson = "{\"status\":\"error\", \"message\":\"Command rate limit: Please wait 1.5s between triggers.\"}";
+    }
+    else if (relayActive) {
+      httpCode = 429;
+      responseJson = "{\"status\":\"error\", \"message\":\"Relay is actively pressing. Please wait.\"}";
+    }
     else {
-      lastCommandedDirection = (lastCommandedDirection == STATE_OPENING) ? STATE_CLOSING : STATE_OPENING;
-      nextState = lastCommandedDirection;
+      clearFaultFlags();
+
+      // Verify sensor disengages after pulsing
+      if (currentState == STATE_CLOSED || currentState == STATE_OPEN) {
+        pulseVerificationPending = true;
+        pulseOriginState = currentState;
+      } else {
+        pulseVerificationPending = false;
+      }
+
+      // Pulse relay (wall button toggle behavior)
+      triggerRelay();
+
+      DoorState nextState = currentState;
+
+      if (currentState == STATE_OPENING || currentState == STATE_CLOSING) {
+        nextState = STATE_STOPPED;
+        currentPositionPct = calculateCurrentPosition();
+        startPositionPct = currentPositionPct;
+        hasIntermediateStop = true;
+        switchUnseated = false;
+      }
+      else if (currentState == STATE_STOPPED || currentState == STATE_UNKNOWN) {
+        startPositionPct = currentPositionPct;
+        hasIntermediateStop = true;
+        switchUnseated = true;
+        activeFlightStartTime = millis();
+
+        if (realClosedSensor && realOpenSensor) {
+          // Sensor fault: alternate direction
+          lastCommandedDirection = (lastCommandedDirection == STATE_OPENING) ? STATE_CLOSING : STATE_OPENING;
+          nextState = lastCommandedDirection;
+        }
+        else if (previousState == STATE_OPENING) nextState = STATE_CLOSING;
+        else if (previousState == STATE_CLOSING) nextState = STATE_OPENING;
+        else if (previousState == STATE_CLOSED) nextState = STATE_OPENING;
+        else if (previousState == STATE_OPEN) nextState = STATE_CLOSING;
+        else {
+          lastCommandedDirection = (lastCommandedDirection == STATE_OPENING) ? STATE_CLOSING : STATE_OPENING;
+          nextState = lastCommandedDirection;
+        }
+      }
+      else if (currentState == STATE_CLOSED) {
+        nextState = STATE_OPENING;
+        lastCommandedDirection = STATE_OPENING;
+        startPositionPct = 0;
+        switchUnseated = true;
+        activeFlightStartTime = relayTriggerTime;
+        hasIntermediateStop = false;
+      }
+      else if (currentState == STATE_OPEN) {
+        nextState = STATE_CLOSING;
+        lastCommandedDirection = STATE_CLOSING;
+        startPositionPct = 100;
+        switchUnseated = true;
+        activeFlightStartTime = relayTriggerTime;
+        hasIntermediateStop = false;
+      }
+
+      if (nextState != currentState) {
+        previousState = currentState;
+        currentState = nextState;
+        lastStateChangeTime = millis();
+        Serial.printf("Toggle State Transition: %s\n", getDebugString(currentState));
+        saveStateToNVS();
+      }
+
+      httpCode = 200;
+      responseJson = "{\"status\":\"success\", \"message\":\"Relay triggered\"}";
     }
   }
-  else if (currentState == STATE_CLOSED) {
-    nextState = STATE_OPENING;
-    lastCommandedDirection = STATE_OPENING;
-    startPositionPct = 0;
-    switchUnseated = true;
-    activeFlightStartTime = relayTriggerTime;
-    hasIntermediateStop = false;
-  }
-  else if (currentState == STATE_OPEN) {
-    nextState = STATE_CLOSING;
-    lastCommandedDirection = STATE_CLOSING;
-    startPositionPct = 100;
-    switchUnseated = true;
-    activeFlightStartTime = relayTriggerTime;
-    hasIntermediateStop = false;
-  }
 
-  if (nextState != currentState) {
-    previousState = currentState;
-    currentState = nextState;
-    lastStateChangeTime = millis();
-    Serial.printf("Toggle State Transition: %s\n", getDebugString(currentState));
-    saveStateToNVS();
-  }
-
-  server.send(200, "application/json", "{\"status\":\"success\", \"message\":\"Relay triggered\"}");
+  server.send(httpCode, "application/json", responseJson);
 }
 
 void handleOn() {
@@ -450,78 +468,91 @@ void handleOn() {
     server.send(403, "application/json", "{\"status\":\"error\", \"message\":\"Cross-origin request forbidden\"}");
     return;
   }
-  DoorStateLock lock;
-  if (!lock.acquired) {
-    server.send(503, "application/json", "{\"status\":\"error\", \"message\":\"Door controller busy\"}");
+  if (isFirmwareUpdating()) {
+    server.send(409, "application/json", "{\"status\":\"error\", \"message\":\"Firmware update in progress. Controls locked.\"}");
     return;
   }
 
-  if (lastPulseTime > 0 && (millis() - lastPulseTime < COMMAND_LOCKOUT_MS)) {
-    server.send(429, "application/json", "{\"status\":\"error\", \"message\":\"Command rate limit: Please wait 1.5s between triggers.\"}");
-    return;
+  int httpCode = 200;
+  const char* responseJson = "";
+
+  {
+    DoorStateLock lock;
+    if (!lock.acquired) {
+      server.send(503, "application/json", "{\"status\":\"error\", \"message\":\"Door controller busy\"}");
+      return;
+    }
+
+    if (lastPulseTime > 0 && (millis() - lastPulseTime < COMMAND_LOCKOUT_MS)) {
+      httpCode = 429;
+      responseJson = "{\"status\":\"error\", \"message\":\"Command rate limit: Please wait 1.5s between triggers.\"}";
+    }
+    // Require manual toggle to clear stall faults
+    else if (midTrackStall || failedToMove) {
+      httpCode = 409;
+      responseJson = "{\"status\":\"error\", \"message\":\"Movement locked due to stall or failed-to-move fault. Use POST /toggle to manually override.\"}";
+    }
+    else if (pendingState == STATE_OPENING || currentState == STATE_OPEN || currentState == STATE_OPENING) {
+      httpCode = 200;
+      responseJson = "{\"status\":\"ignored\", \"message\":\"Door is already open or opening.\"}";
+    }
+    else if (relayActive || pendingState != STATE_UNKNOWN) {
+      httpCode = 429;
+      responseJson = "{\"status\":\"error\", \"message\":\"Relay is actively pressing or pending sequence. Please wait.\"}";
+    }
+    else {
+      clearFaultFlags();
+
+      triggerRelay();
+      lastCommandedDirection = STATE_OPENING;
+
+      if (currentState == STATE_CLOSED) {
+        pulseVerificationPending = true;
+        pulseOriginState = STATE_CLOSED;
+        startPositionPct = 0;
+        switchUnseated = true;
+        activeFlightStartTime = relayTriggerTime;
+        hasIntermediateStop = false;
+      } else if (currentState == STATE_STOPPED) {
+        startPositionPct = currentPositionPct;
+        hasIntermediateStop = true;
+        switchUnseated = true;
+        activeFlightStartTime = relayTriggerTime;
+      }
+
+      if (currentState == STATE_CLOSING) {
+        currentPositionPct = calculateCurrentPosition();
+        startPositionPct = currentPositionPct;
+        hasIntermediateStop = true;
+        switchUnseated = false;
+        previousState = currentState;
+        currentState = STATE_STOPPED;
+        pendingState = STATE_OPENING;
+        pendingPulsesCount = 1;
+        saveStateToNVS();
+        httpCode = 200;
+        responseJson = "{\"status\":\"success\", \"message\":\"Relay triggered to STOP closing; queued OPEN in 500ms.\"}";
+      }
+      else if (currentState == STATE_STOPPED && previousState == STATE_OPENING) {
+        pendingState = STATE_OPENING;
+        pendingPulsesCount = 2;
+        saveStateToNVS();
+        httpCode = 200;
+        responseJson = "{\"status\":\"success\", \"message\":\"Relay sequence started; queued OPEN in 500ms.\"}";
+      }
+      else {
+        previousState = currentState;
+        currentState = STATE_OPENING;
+        lastStateChangeTime = millis();
+        pendingState = STATE_UNKNOWN;
+        pendingPulsesCount = 0;
+        httpCode = 200;
+        responseJson = "{\"status\":\"success\", \"message\":\"Relay triggered to OPEN door.\"}";
+      }
+    }
   }
 
-  // Require manual toggle to clear stall faults
-  if (midTrackStall || failedToMove) {
-    server.send(409, "application/json", "{\"status\":\"error\", \"message\":\"Movement locked due to stall or failed-to-move fault. Use POST /toggle to manually override.\"}");
-    return;
-  }
-
-  clearFaultFlags();
-
-  if (pendingState == STATE_OPENING || currentState == STATE_OPEN || currentState == STATE_OPENING) {
-    server.send(200, "application/json", "{\"status\":\"ignored\", \"message\":\"Door is already open or opening.\"}");
-    return;
-  }
-
-  if (relayActive || pendingState != STATE_UNKNOWN) {
-    server.send(429, "application/json", "{\"status\":\"error\", \"message\":\"Relay is actively pressing or pending sequence. Please wait.\"}");
-    return;
-  }
-
-  triggerRelay();
-  lastCommandedDirection = STATE_OPENING;
-
-  if (currentState == STATE_CLOSED) {
-    pulseVerificationPending = true;
-    pulseOriginState = STATE_CLOSED;
-    startPositionPct = 0;
-    switchUnseated = true;
-    activeFlightStartTime = relayTriggerTime;
-    hasIntermediateStop = false;
-  } else if (currentState == STATE_STOPPED) {
-    startPositionPct = currentPositionPct;
-    hasIntermediateStop = true;
-    switchUnseated = true;
-    activeFlightStartTime = relayTriggerTime;
-  }
-
-  if (currentState == STATE_CLOSING) {
-    currentPositionPct = calculateCurrentPosition();
-    startPositionPct = currentPositionPct;
-    hasIntermediateStop = true;
-    switchUnseated = false;
-    previousState = currentState;
-    currentState = STATE_STOPPED;
-    pendingState = STATE_OPENING;
-    pendingPulsesCount = 1;
-    saveStateToNVS();
-    server.send(200, "application/json", "{\"status\":\"success\", \"message\":\"Relay triggered to STOP closing; queued OPEN in 500ms.\"}");
-  }
-  else if (currentState == STATE_STOPPED && previousState == STATE_OPENING) {
-    pendingState = STATE_OPENING;
-    pendingPulsesCount = 2;
-    saveStateToNVS();
-    server.send(200, "application/json", "{\"status\":\"success\", \"message\":\"Relay sequence started; queued OPEN in 500ms.\"}");
-  }
-  else {
-    previousState = currentState;
-    currentState = STATE_OPENING;
-    lastStateChangeTime = millis();
-    pendingState = STATE_UNKNOWN;
-    pendingPulsesCount = 0;
-    server.send(200, "application/json", "{\"status\":\"success\", \"message\":\"Relay triggered to OPEN door.\"}");
-  }
+  server.send(httpCode, "application/json", responseJson);
 }
 
 void handleOff() {
@@ -529,78 +560,91 @@ void handleOff() {
     server.send(403, "application/json", "{\"status\":\"error\", \"message\":\"Cross-origin request forbidden\"}");
     return;
   }
-  DoorStateLock lock;
-  if (!lock.acquired) {
-    server.send(503, "application/json", "{\"status\":\"error\", \"message\":\"Door controller busy\"}");
+  if (isFirmwareUpdating()) {
+    server.send(409, "application/json", "{\"status\":\"error\", \"message\":\"Firmware update in progress. Controls locked.\"}");
     return;
   }
 
-  if (lastPulseTime > 0 && (millis() - lastPulseTime < COMMAND_LOCKOUT_MS)) {
-    server.send(429, "application/json", "{\"status\":\"error\", \"message\":\"Command rate limit: Please wait 1.5s between triggers.\"}");
-    return;
+  int httpCode = 200;
+  const char* responseJson = "";
+
+  {
+    DoorStateLock lock;
+    if (!lock.acquired) {
+      server.send(503, "application/json", "{\"status\":\"error\", \"message\":\"Door controller busy\"}");
+      return;
+    }
+
+    if (lastPulseTime > 0 && (millis() - lastPulseTime < COMMAND_LOCKOUT_MS)) {
+      httpCode = 429;
+      responseJson = "{\"status\":\"error\", \"message\":\"Command rate limit: Please wait 1.5s between triggers.\"}";
+    }
+    // Require manual toggle to clear stall faults
+    else if (midTrackStall || failedToMove) {
+      httpCode = 409;
+      responseJson = "{\"status\":\"error\", \"message\":\"Movement locked due to stall or failed-to-move fault. Use POST /toggle to manually override.\"}";
+    }
+    else if (pendingState == STATE_CLOSING || currentState == STATE_CLOSED || currentState == STATE_CLOSING) {
+      httpCode = 200;
+      responseJson = "{\"status\":\"ignored\", \"message\":\"Door is already closed or closing.\"}";
+    }
+    else if (relayActive || pendingState != STATE_UNKNOWN) {
+      httpCode = 429;
+      responseJson = "{\"status\":\"error\", \"message\":\"Relay is actively pressing or pending sequence. Please wait.\"}";
+    }
+    else {
+      clearFaultFlags();
+
+      triggerRelay();
+      lastCommandedDirection = STATE_CLOSING;
+
+      if (currentState == STATE_OPEN) {
+        pulseVerificationPending = true;
+        pulseOriginState = STATE_OPEN;
+        startPositionPct = 100;
+        switchUnseated = true;
+        activeFlightStartTime = relayTriggerTime;
+        hasIntermediateStop = false;
+      } else if (currentState == STATE_STOPPED) {
+        startPositionPct = currentPositionPct;
+        hasIntermediateStop = true;
+        switchUnseated = true;
+        activeFlightStartTime = relayTriggerTime;
+      }
+
+      if (currentState == STATE_OPENING) {
+        currentPositionPct = calculateCurrentPosition();
+        startPositionPct = currentPositionPct;
+        hasIntermediateStop = true;
+        switchUnseated = false;
+        previousState = currentState;
+        currentState = STATE_STOPPED;
+        pendingState = STATE_CLOSING;
+        pendingPulsesCount = 1;
+        saveStateToNVS();
+        httpCode = 200;
+        responseJson = "{\"status\":\"success\", \"message\":\"Relay triggered to STOP opening; queued CLOSE in 500ms.\"}";
+      }
+      else if (currentState == STATE_STOPPED && previousState == STATE_CLOSING) {
+        pendingState = STATE_CLOSING;
+        pendingPulsesCount = 2;
+        saveStateToNVS();
+        httpCode = 200;
+        responseJson = "{\"status\":\"success\", \"message\":\"Relay sequence started; queued CLOSE in 500ms.\"}";
+      }
+      else {
+        previousState = currentState;
+        currentState = STATE_CLOSING;
+        lastStateChangeTime = millis();
+        pendingState = STATE_UNKNOWN;
+        pendingPulsesCount = 0;
+        httpCode = 200;
+        responseJson = "{\"status\":\"success\", \"message\":\"Relay triggered to CLOSE door.\"}";
+      }
+    }
   }
 
-  // Require manual toggle to clear stall faults
-  if (midTrackStall || failedToMove) {
-    server.send(409, "application/json", "{\"status\":\"error\", \"message\":\"Movement locked due to stall or failed-to-move fault. Use POST /toggle to manually override.\"}");
-    return;
-  }
-
-  clearFaultFlags();
-
-  if (pendingState == STATE_CLOSING || currentState == STATE_CLOSED || currentState == STATE_CLOSING) {
-    server.send(200, "application/json", "{\"status\":\"ignored\", \"message\":\"Door is already closed or closing.\"}");
-    return;
-  }
-
-  if (relayActive || pendingState != STATE_UNKNOWN) {
-    server.send(429, "application/json", "{\"status\":\"error\", \"message\":\"Relay is actively pressing or pending sequence. Please wait.\"}");
-    return;
-  }
-
-  triggerRelay();
-  lastCommandedDirection = STATE_CLOSING;
-
-  if (currentState == STATE_OPEN) {
-    pulseVerificationPending = true;
-    pulseOriginState = STATE_OPEN;
-    startPositionPct = 100;
-    switchUnseated = true;
-    activeFlightStartTime = relayTriggerTime;
-    hasIntermediateStop = false;
-  } else if (currentState == STATE_STOPPED) {
-    startPositionPct = currentPositionPct;
-    hasIntermediateStop = true;
-    switchUnseated = true;
-    activeFlightStartTime = relayTriggerTime;
-  }
-
-  if (currentState == STATE_OPENING) {
-    currentPositionPct = calculateCurrentPosition();
-    startPositionPct = currentPositionPct;
-    hasIntermediateStop = true;
-    switchUnseated = false;
-    previousState = currentState;
-    currentState = STATE_STOPPED;
-    pendingState = STATE_CLOSING;
-    pendingPulsesCount = 1;
-    saveStateToNVS();
-    server.send(200, "application/json", "{\"status\":\"success\", \"message\":\"Relay triggered to STOP opening; queued CLOSE in 500ms.\"}");
-  }
-  else if (currentState == STATE_STOPPED && previousState == STATE_CLOSING) {
-    pendingState = STATE_CLOSING;
-    pendingPulsesCount = 2;
-    saveStateToNVS();
-    server.send(200, "application/json", "{\"status\":\"success\", \"message\":\"Relay sequence started; queued CLOSE in 500ms.\"}");
-  }
-  else {
-    previousState = currentState;
-    currentState = STATE_CLOSING;
-    lastStateChangeTime = millis();
-    pendingState = STATE_UNKNOWN;
-    pendingPulsesCount = 0;
-    server.send(200, "application/json", "{\"status\":\"success\", \"message\":\"Relay triggered to CLOSE door.\"}");
-  }
+  server.send(httpCode, "application/json", responseJson);
 }
 
 // Debounce limit switch inputs
