@@ -1217,13 +1217,16 @@ void handleUpdateForm() {
 
 static const char* webOtaError = nullptr;
 static bool webOtaSuspended = false;
+static bool webOtaDone = false;
 static bool arduinoOtaActive = false;
+static bool arduinoOtaRejected = false;
 
 void handleUpdateUpload() {
   HTTPUpload& upload = server.upload();
 
   if (upload.status == UPLOAD_FILE_START) {
     webOtaError = nullptr;
+    webOtaDone = false;
 
     if (!isSameOriginRequest()) {
       webOtaError = "Cross-origin request forbidden";
@@ -1233,7 +1236,7 @@ void handleUpdateUpload() {
 
     if (isFirmwareUpdating() || arduinoOtaActive) {
       webOtaError = "Firmware update already in progress";
-      Update.abort();
+      // Do not abort shared Update singleton if another updater (ArduinoOTA) is running
       return;
     }
 
@@ -1292,6 +1295,7 @@ void handleUpdateUpload() {
   } else if (upload.status == UPLOAD_FILE_END) {
     if (webOtaError != nullptr) return;
     if (Update.end(true)) {
+      webOtaDone = true;
       Serial.printf("[WebOTA] Update successfully completed! Total bytes: %u\n", upload.totalSize);
     } else {
       Update.printError(Serial);
@@ -1302,6 +1306,8 @@ void handleUpdateUpload() {
       }
     }
   } else if (upload.status == UPLOAD_FILE_ABORTED) {
+    webOtaError = "Upload aborted by client";
+    webOtaDone = false;
     Update.abort();
     if (webOtaSuspended) {
       resumeSafetyTask();
@@ -1318,15 +1324,18 @@ void setupOTA() {
     // Prevent OTA update while door is in motion or if an update is already running
     if (currentState == STATE_OPENING || currentState == STATE_CLOSING || isFirmwareUpdating()) {
       Serial.println("\n[ArduinoOTA] Rejected: Door is in motion or update in progress!");
+      arduinoOtaRejected = true;
       Update.begin(1); // Force internal Update.begin() inside ArduinoOTA to fail with "already running" -> OTA_BEGIN_ERROR
       return;
     }
+    arduinoOtaRejected = false;
     arduinoOtaActive = true;
     suspendSafetyTask();
     Serial.println("\n[ArduinoOTA] Wireless firmware update starting...");
   });
   ArduinoOTA.onEnd([]() {
     arduinoOtaActive = false;
+    arduinoOtaRejected = false;
     resumeSafetyTask();
     Serial.println("\n[ArduinoOTA] Wireless firmware update complete!");
   });
@@ -1336,9 +1345,12 @@ void setupOTA() {
     }
   });
   ArduinoOTA.onError([](ota_error_t error) {
+    if (arduinoOtaActive || arduinoOtaRejected || error == OTA_BEGIN_ERROR) {
+      Update.abort();
+      arduinoOtaRejected = false;
+    }
     if (arduinoOtaActive) {
       arduinoOtaActive = false;
-      Update.abort();
       resumeSafetyTask();
     }
     Serial.printf("[ArduinoOTA] Error[%u]: ", error);
@@ -1374,6 +1386,8 @@ void initWebPortal() {
         resumeSafetyTask();
         webOtaSuspended = false;
       }
+      webOtaError = nullptr;
+      webOtaDone = false;
       server.send(403, "application/json", "{\"status\":\"error\",\"message\":\"Cross-origin request forbidden\"}");
       return;
     }
@@ -1384,6 +1398,8 @@ void initWebPortal() {
           resumeSafetyTask();
           webOtaSuspended = false;
         }
+        webOtaError = nullptr;
+        webOtaDone = false;
         server.send(503, "application/json", "{\"status\":\"error\",\"message\":\"State lock acquisition timeout\"}");
         return;
       }
@@ -1392,20 +1408,25 @@ void initWebPortal() {
           resumeSafetyTask();
           webOtaSuspended = false;
         }
+        webOtaError = nullptr;
+        webOtaDone = false;
         server.send(409, "application/json", "{\"status\":\"error\",\"message\":\"Door is in motion. Update locked for safety.\"}");
         return;
       }
     }
-    bool hasError = Update.hasError() || (webOtaError != nullptr);
+    bool hasError = !webOtaDone || Update.hasError() || (webOtaError != nullptr);
     if (hasError) {
       if (webOtaSuspended) {
         resumeSafetyTask();
         webOtaSuspended = false;
       }
-      String errMsg = webOtaError ? String(webOtaError) : "Firmware update failed!";
+      String errMsg = webOtaError ? String(webOtaError) : (!webOtaDone ? "No firmware data received or upload aborted" : "Firmware update failed!");
       webOtaError = nullptr;
+      webOtaDone = false;
       server.send(500, "application/json", String("{\"status\":\"error\",\"message\":\"") + errMsg + "\"}");
     } else {
+      webOtaError = nullptr;
+      webOtaDone = false;
       server.send(200, "application/json", "{\"status\":\"success\",\"message\":\"Firmware updated successfully! Rebooting ESP32...\"}");
       delay(1000);
       ESP.restart();
