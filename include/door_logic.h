@@ -14,15 +14,13 @@ extern bool realOpenSensor;
 extern bool lastReadingClosed;
 extern bool lastReadingOpen;
 
-// Relay pulse state
 extern volatile bool relayActive;
 extern volatile unsigned long relayTriggerTime;
 extern volatile DoorState pendingState;
-extern int pendingPulsesCount;
+extern volatile int pendingPulsesCount;
 
 void releaseRelayIfExpired();
 
-// Diagnostic flags
 extern bool obstacleWarning;
 extern bool sensorFault;
 extern bool sensorTimeoutError;
@@ -41,7 +39,6 @@ struct DoorStateLock {
   ~DoorStateLock();
 };
 
-// Calibration & Position Tracking
 extern unsigned long openDurationMs;
 extern unsigned long closeDurationMs;
 extern unsigned long nvsStoredOpenMs;

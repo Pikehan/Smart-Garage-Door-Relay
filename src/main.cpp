@@ -36,7 +36,6 @@ bool isFirmwareUpdating() {
   return safetyTaskPaused;
 }
 
-// Core 0 task for sensor polling and relay timing
 void doorSafetyTask(void *pvParameters) {
 #if ENABLE_SERIAL_DEBUG
   unsigned long lastStackCheck = 0;
@@ -60,7 +59,7 @@ void doorSafetyTask(void *pvParameters) {
     if (!safetyTaskPaused && (millis() - lastStackCheck > 60000)) {
       lastStackCheck = millis();
       UBaseType_t highWaterMark = uxTaskGetStackHighWaterMark(NULL);
-      Serial.printf("[Task] doorSafetyTask Stack High-Water: %u bytes remaining\n", (unsigned int)(highWaterMark * sizeof(StackType_t)));
+      Serial.printf("[Task] doorSafetyTask Stack High-Water: %u bytes remaining\n", (unsigned int)highWaterMark);
     }
 #endif
 
@@ -72,7 +71,7 @@ void setup() {
   Serial.begin(115200);
   Serial.println("\n=== ESP32 GARAGE DOOR CONTROLLER BOOT ===");
   initDoorHardware();
-  xTaskCreatePinnedToCore(doorSafetyTask, "SafetyTask", 4096, NULL, 5, &safetyTaskHandle, 0);
+  xTaskCreatePinnedToCore(doorSafetyTask, "SafetyTask", 6144, NULL, 5, &safetyTaskHandle, 0);
   initWiFi();
   WiFi.setSleep(ENABLE_WIFI_SLEEP ? true : false);
   initWebPortal();

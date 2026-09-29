@@ -11,8 +11,11 @@
 WebServer server(80);
 static int currentNetwork = 1;
 static unsigned long lastWifiAttempt = 0;
-static bool wifiConnected = false;
+static volatile bool wifiConnected = false;
+static volatile unsigned long wifiConnectedSince = 0;
 bool apModeActive = false;
+static bool webOtaSuspended = false;
+static bool arduinoOtaActive = false;
 
 static String activeSsidPrimary;
 static String activePassPrimary;
@@ -40,14 +43,20 @@ bool isSameOriginRequest() {
   String target = server.hasHeader("Origin") ? server.header("Origin") : (server.hasHeader("Referer") ? server.header("Referer") : "");
   if (target.length() == 0) return true;
 
-  // Strip protocol
   int start = 0;
   if (target.startsWith("http://")) start = 7;
   else if (target.startsWith("https://")) start = 8;
   int end = target.indexOf('/', start);
   String host = (end != -1) ? target.substring(start, end) : target.substring(start);
   int portIdx = host.indexOf(':');
-  if (portIdx != -1) host = host.substring(0, portIdx);
+  if (portIdx != -1) {
+    String port = host.substring(portIdx + 1);
+    if (port != "80") {
+      Serial.printf("[Security] Blocked non-standard port origin: %s\n", target.c_str());
+      return false;
+    }
+    host = host.substring(0, portIdx);
+  }
 
   // Strict identity checks to prevent DNS rebinding attacks
   if (host.equalsIgnoreCase(DEVICE_HOSTNAME) ||
@@ -61,7 +70,6 @@ bool isSameOriginRequest() {
   return false;
 }
 
-// Wi-Fi credentials in NVS Flash
 bool loadWiFiCredentials(String& ssidPri, String& passPri, String& ssidBak, String& passBak) {
   wifiPrefs.begin("wifi_cfg", true);
   ssidPri = wifiPrefs.getString("ssid_pri", "");
@@ -110,17 +118,23 @@ static void startSoftAPPortal() {
 }
 
 static volatile bool mdnsPending = false;
+static volatile bool apDisablePending = false;
 
 void onWiFiEvent(WiFiEvent_t event) {
   switch (event) {
     case ARDUINO_EVENT_WIFI_STA_GOT_IP:
       wifiConnected = true;
+      wifiConnectedSince = millis();
       Serial.print("\n[WiFi] Connected! IP Address: ");
       Serial.println(WiFi.localIP());
       mdnsPending = true;
+      if (apModeActive) {
+        apDisablePending = true;
+      }
       break;
     case ARDUINO_EVENT_WIFI_STA_DISCONNECTED:
       wifiConnected = false;
+      wifiConnectedSince = 0;
       Serial.println("\n[WiFi] Disconnected or lost connection.");
       break;
     default:
@@ -146,7 +160,7 @@ static void triggerWiFiConnect() {
         Serial.println("[WiFi] Failed to configure Static IP");
       }
 #else
-      WiFi.config(INADDR_NONE, INADDR_NONE, INADDR_NONE);
+      WiFi.config(IPAddress(0, 0, 0, 0), IPAddress(0, 0, 0, 0), IPAddress(0, 0, 0, 0));
 #endif
       Serial.print("[WiFi] Connecting to Primary Wi-Fi: ");
       Serial.println(activeSsidPrimary);
@@ -159,7 +173,7 @@ static void triggerWiFiConnect() {
       currentNetwork = 1;
       return;
     }
-    WiFi.config(INADDR_NONE, INADDR_NONE, INADDR_NONE);
+    WiFi.config(IPAddress(0, 0, 0, 0), IPAddress(0, 0, 0, 0), IPAddress(0, 0, 0, 0));
     Serial.print("[WiFi] Connecting to Backup Wi-Fi: ");
     Serial.println(activeSsidBackup);
     WiFi.begin(activeSsidBackup.c_str(), activePassBackup.c_str());
@@ -171,7 +185,6 @@ void initWiFi() {
   WiFi.mode(WIFI_STA);
   WiFi.onEvent(onWiFiEvent);
 
-  // Load credentials from flash; start setup AP if none exist
   bool hasCredentials = loadWiFiCredentials(activeSsidPrimary, activePassPrimary, activeSsidBackup, activePassBackup);
 
   // Only seed compile-time credentials if NVS is empty
@@ -189,9 +202,8 @@ void initWiFi() {
   Serial.println("\n[WiFi] Initializing Wi-Fi Station Mode from NVS...");
   triggerWiFiConnect();
 
-  // Allow initial connection window
   unsigned long start = millis();
-  while (!wifiConnected && (millis() - start < 3000)) {
+  while (!wifiConnected && (millis() - start < 7000)) {
     delay(10);
   }
 
@@ -205,6 +217,17 @@ void initWiFi() {
 static unsigned long wifiOfflineStartTime = 0;
 
 void handleWiFiReconnection() {
+  if (webOtaSuspended || isFirmwareUpdating() || arduinoOtaActive) {
+    return;
+  }
+
+  if (apDisablePending && wifiConnected) {
+    apDisablePending = false;
+    WiFi.softAPdisconnect(true);
+    apModeActive = false;
+    Serial.println("[WiFi] Station connected; SoftAP disabled.");
+  }
+
   if (mdnsPending && wifiConnected) {
     mdnsPending = false;
     if (MDNS.begin(DEVICE_HOSTNAME)) {
@@ -233,7 +256,7 @@ void handleWiFiReconnection() {
     return;
   }
 
-  if (!wifiConnected && (millis() - lastWifiAttempt >= RECONNECT_INTERVAL_MS)) {
+  if (!wifiConnected && (!apModeActive || WiFi.softAPgetStationNum() == 0) && (millis() - lastWifiAttempt >= RECONNECT_INTERVAL_MS)) {
     Serial.println("[WiFi] Connection down. Triggering non-blocking reconnect...");
     if (activeSsidBackup.length() > 0) {
       currentNetwork = (currentNetwork == 1) ? 2 : 1;
@@ -253,15 +276,20 @@ void validateAppRollback() {
   esp_ota_img_states_t ota_state;
   if (esp_ota_get_state_partition(running, &ota_state) == ESP_OK) {
     if (ota_state == ESP_OTA_IMG_PENDING_VERIFY) {
-      if (!wifiConnected && millis() > 180000UL) {
-        Serial.println("[OTA] Critical: Wi-Fi unreachable after 3 minutes. Rolling back firmware!");
-        esp_ota_mark_app_invalid_rollback_and_reboot();
-        return;
+      bool hasCredentials = (activeSsidPrimary.length() > 0 || activeSsidBackup.length() > 0);
+      if (hasCredentials) {
+        if (!wifiConnected && millis() > 180000UL) {
+          Serial.println("[OTA] Critical: Wi-Fi unreachable after 3 minutes. Rolling back firmware!");
+          esp_ota_mark_app_invalid_rollback_and_reboot();
+          return;
+        }
+        if (!wifiConnected || (millis() - wifiConnectedSince < 30000UL)) return;
+      } else {
+        if (millis() < 30000UL) return;
       }
-      if (millis() < 30000 || !wifiConnected) return;
 
       esp_ota_mark_app_valid_cancel_rollback();
-      Serial.println("[OTA] Firmware self-check passed: 30s runtime & Wi-Fi stable. Rollback cancelled.");
+      Serial.println("[OTA] Firmware self-check passed: 30s runtime & network stable. Rollback cancelled.");
     }
   }
   validated = true;
@@ -784,7 +812,6 @@ function updateUI(data){
     lastCommandedDir = data.last_commanded_direction.toUpperCase();
   }
 
-  // Calibration sync
   if (typeof data.open_duration_ms === 'number' && data.open_duration_ms >= 5000) {
     openDurationMs = data.open_duration_ms;
   }
@@ -794,7 +821,6 @@ function updateUI(data){
 
   const serverPos = (data.position_pct !== undefined) ? data.position_pct : clientPosPct;
 
-  // State Badge styling
   const b = document.getElementById('doorStateBadge');
 
   if (isFirstLoad) {
@@ -815,7 +841,6 @@ function updateUI(data){
     }
     isFirstLoad = false;
   } else {
-    // Difference check: if difference > 5%, smoothly correct; otherwise don't change
     if (state === 'OPEN') {
       const diff = Math.abs(clientPosPct - 100);
       if (animState === 'OPENING') {
@@ -884,11 +909,9 @@ function updateUI(data){
     }
   }
 
-  // Subtext
   document.getElementById('doorSubtext').textContent =
     'Last direction: ' + (data.last_commanded_direction || 'NONE');
 
-  // Limit switches
   const sClosed = document.getElementById('sensorClosed');
   sClosed.className = 'tele-val ' + (data.close_sensor ? 'active' : 'inactive');
   sClosed.innerHTML = data.close_sensor ? '&bull; ACTIVE (CLOSED)' : '&bull; INACTIVE';
@@ -897,7 +920,6 @@ function updateUI(data){
   sOpen.className = 'tele-val ' + (data.open_sensor ? 'active' : 'inactive');
   sOpen.innerHTML = data.open_sensor ? '&bull; ACTIVE (OPEN)' : '&bull; INACTIVE';
 
-  // Flags
   function setFlag(elId, val, alertText='ALERT', okText='CLEAR'){
     const el = document.getElementById(elId);
     if(el) {
@@ -910,7 +932,6 @@ function updateUI(data){
   setFlag('flagStall', data.mid_track_stall, 'STALLED');
   setFlag('flagFailedToMove', data.failed_to_move, 'STUCK');
 
-  // Calibration and Position Telemetry
   const openSec = (openDurationMs / 1000).toFixed(1);
   const closeSec = (closeDurationMs / 1000).toFixed(1);
   const calBadge = data.is_calibrated ? ' (Calibrated)' : ' (Default)';
@@ -925,7 +946,6 @@ function updateUI(data){
   document.getElementById('lastDirection').textContent = data.last_commanded_direction || 'NONE';
   document.getElementById('uptimeVal').textContent = formatUptime(data.uptime_seconds || 0);
 
-  // Connection pill
   const p = document.getElementById('connPill');
   p.className = 'status-pill online';
   document.getElementById('connText').textContent = 'Online';
@@ -949,7 +969,6 @@ async function fetchState(){
     const data = await res.json();
     updateUI(data);
 
-    // Client-side RAF engine drives 60fps animations; keep polling at relaxed 2000ms
     if (document.visibilityState === 'visible') {
       pollTimeout = setTimeout(fetchState, 2000);
     }
@@ -1010,7 +1029,7 @@ fetchState();
 </html>)rawliteral";
 
 void handleRoot() {
-  if (apModeActive && !wifiConnected) {
+  if (apModeActive && !wifiConnected && activeSsidPrimary.length() == 0 && activeSsidBackup.length() == 0) {
     handleSetupForm();
     return;
   }
@@ -1028,9 +1047,17 @@ void handleReboot() {
     server.send(409, "application/json", "{\"status\":\"error\",\"message\":\"Firmware update in progress. Reboot locked.\"}");
     return;
   }
-  if (currentState == STATE_OPENING || currentState == STATE_CLOSING) {
-    server.send(409, "application/json", "{\"status\":\"error\",\"message\":\"Door is in motion. Reboot locked for safety.\"}");
-    return;
+  {
+    DoorStateLock lock;
+    if (!lock.acquired) {
+      server.send(503, "application/json", "{\"status\":\"error\",\"message\":\"Door controller busy\"}");
+      return;
+    }
+    if (currentState == STATE_OPENING || currentState == STATE_CLOSING) {
+      server.send(409, "application/json", "{\"status\":\"error\",\"message\":\"Door is in motion. Reboot locked for safety.\"}");
+      return;
+    }
+    suspendSafetyTask();
   }
   server.send(200, "application/json", "{\"status\":\"success\",\"message\":\"Rebooting ESP32 controller...\"}");
   delay(1000);
@@ -1038,12 +1065,12 @@ void handleReboot() {
 }
 
 void handleNotFound() {
-  if (apModeActive && !wifiConnected) {
+  if (apModeActive && !wifiConnected && activeSsidPrimary.length() == 0 && activeSsidBackup.length() == 0) {
     handleSetupForm();
     return;
   }
   sendCORSHeaders();
-  server.send(404, "application/json", "{\"error\":\"Endpoint or Method not found. Available: GET /, /state, /update, /setup | POST /toggle, /on, /off, /reboot, /update, /setup.\"}");
+  server.send(404, "application/json", "{\"error\":\"Endpoint or Method not found. Available: GET /, /state, /update, /setup | POST /toggle, /on, /off, /reboot, /update, /setup, /calibrate/reset.\"}");
 }
 
 static const char SETUP_PAGE_HTML[] PROGMEM = R"rawliteral(<!DOCTYPE html><html><head><meta charset='utf-8'><meta name='viewport' content='width=device-width,initial-scale=1'>
@@ -1085,10 +1112,6 @@ void handleSetupSave() {
     server.send(409, "application/json", "{\"status\":\"error\",\"message\":\"Firmware update in progress. Setup locked.\"}");
     return;
   }
-  if (currentState == STATE_OPENING || currentState == STATE_CLOSING) {
-    server.send(409, "application/json", "{\"status\":\"error\",\"message\":\"Door is in motion. Setup locked for safety.\"}");
-    return;
-  }
 
   String newSsid = server.arg("ssid");
   String newPass = server.arg("pass");
@@ -1098,6 +1121,19 @@ void handleSetupSave() {
   if (newSsid.length() == 0) {
     server.send(400, "application/json", "{\"status\":\"error\",\"message\":\"SSID cannot be empty\"}");
     return;
+  }
+
+  {
+    DoorStateLock lock;
+    if (!lock.acquired) {
+      server.send(503, "application/json", "{\"status\":\"error\",\"message\":\"Door controller busy\"}");
+      return;
+    }
+    if (currentState == STATE_OPENING || currentState == STATE_CLOSING) {
+      server.send(409, "application/json", "{\"status\":\"error\",\"message\":\"Door is in motion. Setup locked for safety.\"}");
+      return;
+    }
+    suspendSafetyTask();
   }
 
   saveWiFiCredentials(newSsid.c_str(), newPass.c_str(), newBakSsid.c_str(), newBakPass.c_str());
@@ -1117,7 +1153,6 @@ void handleUpdateForm() {
     server.send(409, "text/plain", "409 Conflict: Firmware update already in progress.");
     return;
   }
-  // Do not serve update form while door is in motion
   {
     DoorStateLock lock;
     if (!lock.acquired) {
@@ -1130,7 +1165,6 @@ void handleUpdateForm() {
     }
   }
 
-  // Pre-compressed web portal asset
   static const uint32_t UPDATE_PAGE_GZ_LEN = 1209;
   static const uint8_t UPDATE_PAGE_GZ[] PROGMEM = {
     0x1f, 0x8b, 0x08, 0x00, 0xc3, 0xee, 0x9a, 0x6a, 0x02, 0xff, 0x75, 0x56, 0xdb, 0x8e, 0xdb, 0x36,
@@ -1216,10 +1250,8 @@ void handleUpdateForm() {
 }
 
 static const char* webOtaError = nullptr;
-static bool webOtaSuspended = false;
 static bool webOtaDone = false;
-static bool arduinoOtaActive = false;
-static bool arduinoOtaRejected = false;
+static bool firstChunkVerified = false;
 
 void handleUpdateUpload() {
   HTTPUpload& upload = server.upload();
@@ -1227,6 +1259,7 @@ void handleUpdateUpload() {
   if (upload.status == UPLOAD_FILE_START) {
     webOtaError = nullptr;
     webOtaDone = false;
+    firstChunkVerified = false;
 
     if (!isSameOriginRequest()) {
       webOtaError = "Cross-origin request forbidden";
@@ -1240,7 +1273,6 @@ void handleUpdateUpload() {
       return;
     }
 
-    // Prevent firmware writes while door is in motion
     {
       DoorStateLock lock;
       if (!lock.acquired) {
@@ -1255,7 +1287,6 @@ void handleUpdateUpload() {
       }
     }
 
-    // Check available heap before starting update
     if (ESP.getMaxAllocHeap() < 20000) {
       webOtaError = "Low Memory: Reboot before update.";
       Update.abort();
@@ -1272,17 +1303,41 @@ void handleUpdateUpload() {
       webOtaError = "Update.begin failed";
       resumeSafetyTask();
       webOtaSuspended = false;
+      return;
     }
     if (server.hasHeader("x-MD5")) {
       String expectedMD5 = server.header("x-MD5");
       expectedMD5.trim();
       if (expectedMD5.length() == 32) {
-        Update.setMD5(expectedMD5.c_str());
-        Serial.printf("[WebOTA] Enforcing MD5 checksum verification: %s\n", expectedMD5.c_str());
+        bool isHex = true;
+        for (size_t i = 0; i < 32; i++) {
+          if (!isxdigit(expectedMD5[i])) {
+            isHex = false;
+            break;
+          }
+        }
+        if (isHex) {
+          Update.setMD5(expectedMD5.c_str());
+          Serial.printf("[WebOTA] Enforcing MD5 checksum verification: %s\n", expectedMD5.c_str());
+        }
       }
     }
   } else if (upload.status == UPLOAD_FILE_WRITE) {
     if (webOtaError != nullptr) return;
+    if (!firstChunkVerified) {
+      if (upload.currentSize == 0) return;
+      if (upload.buf[0] != 0xE9) {
+        Serial.println("\n[WebOTA] Rejected: Invalid firmware binary (missing ESP32 magic byte 0xE9)!");
+        webOtaError = "Invalid firmware: missing ESP32 magic byte (0xE9)";
+        Update.abort();
+        if (webOtaSuspended) {
+          resumeSafetyTask();
+          webOtaSuspended = false;
+        }
+        return;
+      }
+      firstChunkVerified = true;
+    }
     if (Update.write(upload.buf, upload.currentSize) != upload.currentSize) {
       Update.printError(Serial);
       webOtaError = "Flash write failed";
@@ -1294,6 +1349,15 @@ void handleUpdateUpload() {
     }
   } else if (upload.status == UPLOAD_FILE_END) {
     if (webOtaError != nullptr) return;
+    if (!firstChunkVerified) {
+      webOtaError = "Empty or invalid firmware stream";
+      Update.abort();
+      if (webOtaSuspended) {
+        resumeSafetyTask();
+        webOtaSuspended = false;
+      }
+      return;
+    }
     if (Update.end(true)) {
       webOtaDone = true;
       Serial.printf("[WebOTA] Update successfully completed! Total bytes: %u\n", upload.totalSize);
@@ -1321,22 +1385,12 @@ void handleUpdateUpload() {
 void setupOTA() {
   ArduinoOTA.setHostname(DEVICE_HOSTNAME);
   ArduinoOTA.onStart([]() {
-    // Prevent OTA update while door is in motion or if an update is already running
-    if (currentState == STATE_OPENING || currentState == STATE_CLOSING || isFirmwareUpdating()) {
-      Serial.println("\n[ArduinoOTA] Rejected: Door is in motion or update in progress!");
-      arduinoOtaRejected = true;
-      Update.begin(1); // Force internal Update.begin() inside ArduinoOTA to fail with "already running" -> OTA_BEGIN_ERROR
-      return;
-    }
-    arduinoOtaRejected = false;
     arduinoOtaActive = true;
     suspendSafetyTask();
     Serial.println("\n[ArduinoOTA] Wireless firmware update starting...");
   });
   ArduinoOTA.onEnd([]() {
     arduinoOtaActive = false;
-    arduinoOtaRejected = false;
-    resumeSafetyTask();
     Serial.println("\n[ArduinoOTA] Wireless firmware update complete!");
   });
   ArduinoOTA.onProgress([](unsigned int progress, unsigned int total) {
@@ -1345,11 +1399,8 @@ void setupOTA() {
     }
   });
   ArduinoOTA.onError([](ota_error_t error) {
-    if (arduinoOtaActive || arduinoOtaRejected || error == OTA_BEGIN_ERROR) {
-      Update.abort();
-      arduinoOtaRejected = false;
-    }
     if (arduinoOtaActive) {
+      Update.abort();
       arduinoOtaActive = false;
       resumeSafetyTask();
     }
@@ -1391,29 +1442,6 @@ void initWebPortal() {
       server.send(403, "application/json", "{\"status\":\"error\",\"message\":\"Cross-origin request forbidden\"}");
       return;
     }
-    {
-      DoorStateLock lock;
-      if (!lock.acquired) {
-        if (webOtaSuspended) {
-          resumeSafetyTask();
-          webOtaSuspended = false;
-        }
-        webOtaError = nullptr;
-        webOtaDone = false;
-        server.send(503, "application/json", "{\"status\":\"error\",\"message\":\"State lock acquisition timeout\"}");
-        return;
-      }
-      if (currentState == STATE_OPENING || currentState == STATE_CLOSING) {
-        if (webOtaSuspended) {
-          resumeSafetyTask();
-          webOtaSuspended = false;
-        }
-        webOtaError = nullptr;
-        webOtaDone = false;
-        server.send(409, "application/json", "{\"status\":\"error\",\"message\":\"Door is in motion. Update locked for safety.\"}");
-        return;
-      }
-    }
     bool hasError = !webOtaDone || Update.hasError() || (webOtaError != nullptr);
     if (hasError) {
       if (webOtaSuspended) {
@@ -1454,8 +1482,8 @@ void handleWebClients() {
 
 void handleOTA() {
 #if ENABLE_ARDUINO_OTA
-  // Never service ArduinoOTA while WebOTA is actively flashing
-  if (webOtaSuspended) {
+  // Never service ArduinoOTA while WebOTA is flashing, or if another update is running and ArduinoOTA isn't active
+  if (webOtaSuspended || (!arduinoOtaActive && isFirmwareUpdating())) {
     return;
   }
   if (arduinoOtaActive || (currentState != STATE_OPENING && currentState != STATE_CLOSING)) {

@@ -1,6 +1,8 @@
 # PlatformIO & IDE
 .pio/
 .vscode/
+.clangd
+.clangd/
 compile_commands.json
 
 
@@ -68,10 +70,14 @@ desktop.ini
 *.db
 *.sql
 
-# Local Documentation (Kept locally, excluded from public repository)
+# Local Documentation & AI Agents (Kept locally, excluded from public repository)
 docs/
 AGENTS.md
 agents.md
+.agents/
+.cursorrules
+CLAUDE.md
+.claude/
 
 # Simulator
 tools/simulator/

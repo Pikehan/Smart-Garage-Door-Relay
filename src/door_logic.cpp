@@ -12,13 +12,11 @@ bool realOpenSensor = false;
 bool lastReadingClosed = false;
 bool lastReadingOpen = false;
 
-// Relay pulse state
 volatile bool relayActive = false;
 volatile unsigned long relayTriggerTime = 0;
 volatile DoorState pendingState = STATE_UNKNOWN;
-int pendingPulsesCount = 0;
+volatile int pendingPulsesCount = 0;
 
-// Diagnostics
 bool obstacleWarning = false;
 bool sensorFault = false;
 bool sensorTimeoutError = false;
@@ -29,7 +27,6 @@ unsigned long lastPulseTime = 0;
 bool pulseVerificationPending = false;
 DoorState pulseOriginState = STATE_UNKNOWN;
 
-// Calibration & Position Tracking
 unsigned long openDurationMs = DEFAULT_OPEN_DURATION_MS;
 unsigned long closeDurationMs = DEFAULT_CLOSE_DURATION_MS;
 unsigned long nvsStoredOpenMs = DEFAULT_OPEN_DURATION_MS;
@@ -101,7 +98,7 @@ void initDoorHardware() {
     doorStateMutex = xSemaphoreCreateRecursiveMutex();
   }
 
-  // Active-low relay: set HIGH before OUTPUT mode to prevent spurious pulse on boot
+  // Active-LOW relay: drive HIGH before OUTPUT mode to prevent boot pulse
   digitalWrite(RELAY_PIN, HIGH);
   pinMode(RELAY_PIN, OUTPUT);
   pinMode(OPEN_SENSOR_PIN, INPUT_PULLUP);
@@ -129,7 +126,6 @@ void initDoorHardware() {
   uint8_t savedStopPos = prefs.getUChar("stop_pos", 0);
   prefs.end();
 
-  // Divide-by-zero & math sanity clamping
   if (openDurationMs < MIN_TRAVEL_TIME_MS || openDurationMs > MAX_TRAVEL_TIME_MS) {
     openDurationMs = DEFAULT_OPEN_DURATION_MS;
   }
@@ -147,7 +143,6 @@ void initDoorHardware() {
     lastCalibrationTimeClose = 0;
   }
 
-  // If a limit switch is contacted, set state directly
   if (initialClose && !initialOpen) {
     currentState = STATE_CLOSED;
     previousState = STATE_CLOSED;
@@ -169,7 +164,6 @@ void initDoorHardware() {
     saveStateToNVS();
   }
   else {
-    // Neither sensor active (mid-travel): hold stopped and recover direction from NVS
     currentState = STATE_STOPPED;
     currentPositionPct = (savedStopPos <= 100) ? savedStopPos : 50;
     startPositionPct = currentPositionPct;
@@ -218,27 +212,31 @@ void saveStateToNVS() {
     prefs.putBool("s_open", realOpenSensor);
   }
 
+  uint8_t targetStopPos = 0;
   if (currentState == STATE_CLOSED) {
-    prefs.putUChar("stop_pos", 0);
+    targetStopPos = 0;
   } else if (currentState == STATE_OPEN) {
-    prefs.putUChar("stop_pos", 100);
+    targetStopPos = 100;
   } else if (currentState == STATE_STOPPED) {
-    prefs.putUChar("stop_pos", currentPositionPct);
+    targetStopPos = currentPositionPct;
   }
 
-  // Flash write storm protection:
-  // Only write when resting at CLOSED, cooldown >= 5 min, and cumulative drift >= 200ms
+  if (prefs.getUChar("stop_pos", 255) != targetStopPos) {
+    prefs.putUChar("stop_pos", targetStopPos);
+  }
+
+  // NVS write throttling: resting at CLOSED, >=5min cooldown, >=200ms drift
   unsigned long now = millis();
   if (currentState == STATE_CLOSED && (now - lastNVSWriteTime >= NVS_WRITE_COOLDOWN_MS || lastNVSWriteTime == 0)) {
     bool nvsUpdated = false;
-    long openDelta = (long)openDurationMs - (long)nvsStoredOpenMs;
-    if (labs(openDelta) >= (long)CALIBRATION_NVS_MIN_DELTA_MS) {
+    unsigned long openDelta = (openDurationMs > nvsStoredOpenMs) ? (openDurationMs - nvsStoredOpenMs) : (nvsStoredOpenMs - openDurationMs);
+    if (openDelta >= CALIBRATION_NVS_MIN_DELTA_MS) {
       prefs.putUInt("open_ms", (uint32_t)openDurationMs);
       nvsStoredOpenMs = openDurationMs;
       nvsUpdated = true;
     }
-    long closeDelta = (long)closeDurationMs - (long)nvsStoredCloseMs;
-    if (labs(closeDelta) >= (long)CALIBRATION_NVS_MIN_DELTA_MS) {
+    unsigned long closeDelta = (closeDurationMs > nvsStoredCloseMs) ? (closeDurationMs - nvsStoredCloseMs) : (nvsStoredCloseMs - closeDurationMs);
+    if (closeDelta >= CALIBRATION_NVS_MIN_DELTA_MS) {
       prefs.putUInt("close_ms", (uint32_t)closeDurationMs);
       nvsStoredCloseMs = closeDurationMs;
       nvsUpdated = true;
@@ -307,7 +305,6 @@ void releaseRelayIfExpired() {
 void handleRelay() {
   releaseRelayIfExpired();
 
-  // Handle queued pulses for reverse/stop actions
   if (pendingState != STATE_UNKNOWN && !relayActive && (millis() - relayTriggerTime >= PENDING_RELAY_DELAY)) {
     triggerRelay();
 
@@ -328,7 +325,6 @@ void handleRelay() {
     }
   }
 
-  // Verify limit switch opens after pulsing
   if (pulseVerificationPending && (millis() - lastPulseTime >= SENSOR_DISENGAGE_TIMEOUT)) {
     if ((pulseOriginState == STATE_CLOSED && realClosedSensor) ||
         (pulseOriginState == STATE_OPEN && realOpenSensor)) {
@@ -363,7 +359,6 @@ void handleToggle() {
       return;
     }
 
-    // Cancel pending multi-pulse sequence
     if (pendingState != STATE_UNKNOWN) {
       bool motorMoving = (pendingPulsesCount == 2);
       pendingState = STATE_UNKNOWN;
@@ -378,7 +373,6 @@ void handleToggle() {
       httpCode = 200;
       responseJson = "{\"status\":\"success\", \"message\":\"Cancelled pending movement. Door remains stopped.\"}";
     }
-    // Rate limit rapid triggers
     else if (lastPulseTime > 0 && (millis() - lastPulseTime < COMMAND_LOCKOUT_MS)) {
       httpCode = 429;
       responseJson = "{\"status\":\"error\", \"message\":\"Command rate limit: Please wait 1.5s between triggers.\"}";
@@ -390,7 +384,6 @@ void handleToggle() {
     else {
       clearFaultFlags();
 
-      // Verify sensor disengages after pulsing
       if (currentState == STATE_CLOSED || currentState == STATE_OPEN) {
         pulseVerificationPending = true;
         pulseOriginState = currentState;
@@ -398,7 +391,6 @@ void handleToggle() {
         pulseVerificationPending = false;
       }
 
-      // Pulse relay (wall button toggle behavior)
       triggerRelay();
 
       DoorState nextState = currentState;
@@ -417,7 +409,6 @@ void handleToggle() {
         activeFlightStartTime = millis();
 
         if (realClosedSensor && realOpenSensor) {
-          // Sensor fault: alternate direction
           lastCommandedDirection = (lastCommandedDirection == STATE_OPENING) ? STATE_CLOSING : STATE_OPENING;
           nextState = lastCommandedDirection;
         }
@@ -487,7 +478,6 @@ void handleOn() {
       httpCode = 429;
       responseJson = "{\"status\":\"error\", \"message\":\"Command rate limit: Please wait 1.5s between triggers.\"}";
     }
-    // Require manual toggle to clear stall faults
     else if (midTrackStall || failedToMove) {
       httpCode = 409;
       responseJson = "{\"status\":\"error\", \"message\":\"Movement locked due to stall or failed-to-move fault. Use POST /toggle to manually override.\"}";
@@ -579,7 +569,6 @@ void handleOff() {
       httpCode = 429;
       responseJson = "{\"status\":\"error\", \"message\":\"Command rate limit: Please wait 1.5s between triggers.\"}";
     }
-    // Require manual toggle to clear stall faults
     else if (midTrackStall || failedToMove) {
       httpCode = 409;
       responseJson = "{\"status\":\"error\", \"message\":\"Movement locked due to stall or failed-to-move fault. Use POST /toggle to manually override.\"}";
@@ -647,7 +636,6 @@ void handleOff() {
   server.send(httpCode, "application/json", responseJson);
 }
 
-// Debounce limit switch inputs
 void checkSensorsWithDebounce() {
   bool readingClosed = !digitalRead(CLOSED_SENSOR_PIN);
   bool readingOpen = !digitalRead(OPEN_SENSOR_PIN);
@@ -670,7 +658,6 @@ void checkSensorsWithDebounce() {
   lastReadingOpen = readingOpen;
 }
 
-// State machine evaluation
 void updateLogic() {
   DoorState detectedState = currentState;
 
@@ -682,7 +669,6 @@ void updateLogic() {
     }
   }
 
-  // Both limit switches active indicates sensor or wiring fault
   if (realClosedSensor && realOpenSensor) {
     sensorFault = true;
     hasIntermediateStop = true;
@@ -691,11 +677,8 @@ void updateLogic() {
     }
     detectedState = STATE_STOPPED;
   }
-
-  // Closed switch reached
   else if (realClosedSensor) {
     if (currentState == STATE_OPENING && previousState == STATE_CLOSED && (millis() - lastStateChangeTime < SENSOR_DISENGAGE_TIMEOUT)) {
-      // Ignore closed contact during initial disengage timeout
       detectedState = STATE_OPENING;
     } else {
       if (currentState == STATE_OPENING) {
@@ -703,19 +686,19 @@ void updateLogic() {
         obstacleWarning = true;
         hasIntermediateStop = true;
       } else if (currentState == STATE_CLOSING) {
-        // Successful clean close arrival
         if (activeFlightStartTime > 0 && !hasIntermediateStop) {
           unsigned long rawFlightMs = millis() - activeFlightStartTime;
-          unsigned long measuredFlightMs = rawFlightMs + 1000UL; // +1s switch activation area compensation
+          unsigned long measuredFlightMs = rawFlightMs + REED_SWITCH_CLOSE_OFFSET_MS;
           bool inWindow = (measuredFlightMs >= MIN_TRAVEL_TIME_MS && measuredFlightMs <= MAX_TRAVEL_TIME_MS);
-          bool noOutlier = (!isCalibrated || (labs((long)measuredFlightMs - (long)closeDurationMs) <= (long)CALIBRATION_MAX_DEVIATION_MS));
+          unsigned long closeFlightDelta = (measuredFlightMs > closeDurationMs) ? (measuredFlightMs - closeDurationMs) : (closeDurationMs - measuredFlightMs);
+          bool noOutlier = (!isCalibrated || (closeFlightDelta <= CALIBRATION_MAX_DEVIATION_MS));
           bool dailyReady = (!isCalibrated || (millis() - lastCalibrationTimeClose >= CALIBRATION_INTERVAL_MS || lastCalibrationTimeClose == 0));
 
           if (inWindow && noOutlier && dailyReady) {
-            closeDurationMs = (closeDurationMs * 3UL + measuredFlightMs) / 4UL; // EMA smooth
+            closeDurationMs = (closeDurationMs * 3UL + measuredFlightMs) / 4UL;
             isCalibrated = true;
             lastCalibrationTimeClose = millis();
-            Serial.printf("CALIBRATION: CLOSE duration calibrated: %lu ms (raw: %lu ms + 1000ms activation area)\n", closeDurationMs, rawFlightMs);
+            Serial.printf("CALIBRATION: CLOSE duration calibrated: %lu ms (raw: %lu ms + %lu ms offset)\n", closeDurationMs, rawFlightMs, REED_SWITCH_CLOSE_OFFSET_MS);
           }
         }
       }
@@ -728,10 +711,8 @@ void updateLogic() {
       failedToMove = false;
     }
   }
-  // Open switch reached
   else if (realOpenSensor) {
     if (currentState == STATE_CLOSING && previousState == STATE_OPEN && (millis() - lastStateChangeTime < SENSOR_DISENGAGE_TIMEOUT)) {
-      // Ignore open contact during initial disengage timeout
       detectedState = STATE_CLOSING;
     } else {
       if (currentState == STATE_CLOSING) {
@@ -739,19 +720,19 @@ void updateLogic() {
         obstacleWarning = true;
         hasIntermediateStop = true;
       } else if (currentState == STATE_OPENING) {
-        // Successful clean open arrival
         if (activeFlightStartTime > 0 && !hasIntermediateStop) {
           unsigned long rawFlightMs = millis() - activeFlightStartTime;
-          unsigned long measuredFlightMs = rawFlightMs + 1000UL; // +1s switch activation area compensation
+          unsigned long measuredFlightMs = rawFlightMs + REED_SWITCH_OPEN_OFFSET_MS;
           bool inWindow = (measuredFlightMs >= MIN_TRAVEL_TIME_MS && measuredFlightMs <= MAX_TRAVEL_TIME_MS);
-          bool noOutlier = (!isCalibrated || (labs((long)measuredFlightMs - (long)openDurationMs) <= (long)CALIBRATION_MAX_DEVIATION_MS));
+          unsigned long openFlightDelta = (measuredFlightMs > openDurationMs) ? (measuredFlightMs - openDurationMs) : (openDurationMs - measuredFlightMs);
+          bool noOutlier = (!isCalibrated || (openFlightDelta <= CALIBRATION_MAX_DEVIATION_MS));
           bool dailyReady = (!isCalibrated || (millis() - lastCalibrationTimeOpen >= CALIBRATION_INTERVAL_MS || lastCalibrationTimeOpen == 0));
 
           if (inWindow && noOutlier && dailyReady) {
-            openDurationMs = (openDurationMs * 3UL + measuredFlightMs) / 4UL; // EMA smooth
+            openDurationMs = (openDurationMs * 3UL + measuredFlightMs) / 4UL;
             isCalibrated = true;
             lastCalibrationTimeOpen = millis();
-            Serial.printf("CALIBRATION: OPEN duration calibrated: %lu ms (raw: %lu ms + 1000ms activation area)\n", openDurationMs, rawFlightMs);
+            Serial.printf("CALIBRATION: OPEN duration calibrated: %lu ms (raw: %lu ms + %lu ms offset)\n", openDurationMs, rawFlightMs, REED_SWITCH_OPEN_OFFSET_MS);
           }
         }
       }
@@ -764,7 +745,6 @@ void updateLogic() {
       failedToMove = false;
     }
   }
-  // Detect manual movement if a limit switch unseats without command
   else if (!realClosedSensor && !realOpenSensor) {
     if (currentState == STATE_CLOSED) {
       Serial.println("MANUAL OVERRIDE: CLOSED switch opened externally! Transitioning to OPENING.");
@@ -772,7 +752,7 @@ void updateLogic() {
       startPositionPct = 0;
       switchUnseated = true;
       activeFlightStartTime = millis();
-      hasIntermediateStop = true; // External manual strokes do not auto-calibrate
+      hasIntermediateStop = true;
       pendingState = STATE_UNKNOWN;
       pendingPulsesCount = 0;
       failedToMove = false;
@@ -783,14 +763,13 @@ void updateLogic() {
       startPositionPct = 100;
       switchUnseated = true;
       activeFlightStartTime = millis();
-      hasIntermediateStop = true; // External manual strokes do not auto-calibrate
+      hasIntermediateStop = true;
       pendingState = STATE_UNKNOWN;
       pendingPulsesCount = 0;
       failedToMove = false;
     }
   }
 
-  // Watchdog timeout if travel exceeds limit
   if ((detectedState == STATE_OPENING || detectedState == STATE_CLOSING) &&
       (millis() - lastStateChangeTime >= MOVEMENT_TIMEOUT)) {
     detectedState = STATE_STOPPED;

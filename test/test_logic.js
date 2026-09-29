@@ -1,12 +1,10 @@
 /**
- * AUTOMATED TEST SUITE FOR ESP32 GARAGE DOOR CONTROLLER
- * Transpiles and tests C++ functions directly from src/main.cpp
+ * Automated test suite for ESP32 garage door logic.
  */
 
 const fs = require('fs');
 const path = require('path');
 
-// Read src/door_logic.cpp
 const cppPath = path.join(__dirname, '..', 'src', 'door_logic.cpp');
 if (!fs.existsSync(cppPath)) {
   console.error('❌ Error: src/door_logic.cpp file not found at ' + cppPath);
@@ -15,7 +13,7 @@ if (!fs.existsSync(cppPath)) {
 
 const cppCode = fs.readFileSync(cppPath, 'utf8');
 
-// --- SIMULATED HARDWARE ENVIRONMENT ---
+// Simulated Hardware Environment
 let RELAY_PIN = 27;
 let OPEN_SENSOR_PIN = 25;
 let CLOSED_SENSOR_PIN = 26;
@@ -36,6 +34,8 @@ let CALIBRATION_NVS_MIN_DELTA_MS = 200;
 let CALIBRATION_MAX_DEVIATION_MS = 3500;
 let CALIBRATION_INTERVAL_MS = 86400000;
 let NVS_WRITE_COOLDOWN_MS = 300000;
+let REED_SWITCH_OPEN_OFFSET_MS = 3100;
+let REED_SWITCH_CLOSE_OFFSET_MS = 900;
 
 // Enums
 const STATE_UNKNOWN = 0;
@@ -194,6 +194,8 @@ global.CALIBRATION_NVS_MIN_DELTA_MS = CALIBRATION_NVS_MIN_DELTA_MS;
 global.CALIBRATION_MAX_DEVIATION_MS = CALIBRATION_MAX_DEVIATION_MS;
 global.CALIBRATION_INTERVAL_MS = CALIBRATION_INTERVAL_MS;
 global.NVS_WRITE_COOLDOWN_MS = NVS_WRITE_COOLDOWN_MS;
+global.REED_SWITCH_OPEN_OFFSET_MS = REED_SWITCH_OPEN_OFFSET_MS;
+global.REED_SWITCH_CLOSE_OFFSET_MS = REED_SWITCH_CLOSE_OFFSET_MS;
 
 global.openDurationMs = openDurationMs;
 global.closeDurationMs = closeDurationMs;
@@ -375,7 +377,7 @@ function saveStateToNVS() { global.saveStateToNVS(); }
 function releaseRelayIfExpired() { global.releaseRelayIfExpired(); }
 function isSameOriginRequest() { return true; }
 
-// --- TEST RUNNER ENGINE ---
+// Test Runner Engine
 let totalTests = 0;
 let passedTests = 0;
 let failedTests = 0;
@@ -441,9 +443,7 @@ console.log('====================================================');
 console.log('  🧪 ESP32 GARAGE DOOR CONTROLLER AUTOMATED TESTS  ');
 console.log('====================================================\n');
 
-// --- TEST CASES FOR USER SPECIFICATION ---
-
-// Specification 1: "when I press open if its closed state it should open the door by just sending one relay pulse"
+// Test 1: Open command from closed state
 (() => {
   resetEnvironment();
   global.currentState = STATE_CLOSED;
@@ -456,7 +456,7 @@ console.log('====================================================\n');
   assert(pulseLog.length === 1, 'Spec 1.2: When CLOSED, pressing OPEN sends just 1 relay pulse', `got ${pulseLog.length} pulses`);
 })();
 
-// Specification 2: "if its opening when pressed open it should not do anything"
+// Test 2: Redundant open command ignored
 (() => {
   resetEnvironment();
   global.currentState = STATE_OPENING;
@@ -467,7 +467,7 @@ console.log('====================================================\n');
   assert(pulseLog.length === 0, 'Spec 2.2: When OPENING, pressing OPEN sends 0 relay pulses', `got ${pulseLog.length} pulses`);
 })();
 
-// Specification 3: "if its closing state it shoud send one pulse to stop the closing door wait 500 ms and one pulse to open again"
+// Test 3: Auto-reversal to open when closing
 (() => {
   resetEnvironment();
   global.currentState = STATE_CLOSING;
@@ -478,7 +478,6 @@ console.log('====================================================\n');
   assert(global.pendingState === STATE_OPENING, 'Spec 3.2: When CLOSING, pressing OPEN queues pending state to OPENING', `got ${getDebugString(global.pendingState)}`);
   assert(pulseLog.length === 1, 'Spec 3.3: 1st pulse sent immediately', `got ${pulseLog.length} pulses`);
 
-  // Simulate 500ms delay
   global.relayTriggerTime = millis() - 600;
   global.relayActive = false;
   global.pinRelayState = 1;
@@ -488,7 +487,7 @@ console.log('====================================================\n');
   assert(pulseLog.length === 2, 'Spec 3.5: After waiting 500ms, 2nd pulse sent to OPEN again', `got ${pulseLog.length} pulses`);
 })();
 
-// Specification 4: "when I press close if its open state it should close the door by just sending one relay pulse"
+// Test 4: Close command from open state
 (() => {
   resetEnvironment();
   global.currentState = STATE_OPEN;
@@ -499,7 +498,7 @@ console.log('====================================================\n');
   assert(pulseLog.length === 1, 'Spec 4.2: When OPEN, pressing CLOSE sends just 1 relay pulse', `got ${pulseLog.length} pulses`);
 })();
 
-// Specification 5: "if its closing when pressed close it should not do anything"
+// Test 5: Redundant close command ignored
 (() => {
   resetEnvironment();
   global.currentState = STATE_CLOSING;
@@ -510,7 +509,7 @@ console.log('====================================================\n');
   assert(pulseLog.length === 0, 'Spec 5.2: When CLOSING, pressing CLOSE sends 0 relay pulses', `got ${pulseLog.length} pulses`);
 })();
 
-// Specification 6: "if its opening state it shoud send one pulse to stop the opening door wait 500 ms and one pulse to close again"
+// Test 6: Auto-reversal to close when opening
 (() => {
   resetEnvironment();
   global.currentState = STATE_OPENING;
@@ -521,7 +520,6 @@ console.log('====================================================\n');
   assert(global.pendingState === STATE_CLOSING, 'Spec 6.2: When OPENING, pressing CLOSE queues pending state to CLOSING', `got ${getDebugString(global.pendingState)}`);
   assert(pulseLog.length === 1, 'Spec 6.3: 1st pulse sent immediately', `got ${pulseLog.length} pulses`);
 
-  // Simulate 500ms delay
   global.relayTriggerTime = millis() - 600;
   global.relayActive = false;
   global.pinRelayState = 1;
@@ -728,7 +726,7 @@ console.log('====================================================\n');
   assert(lastServerResponse && lastServerResponse.code === 429, 'Test 17.1: Concurrent command returns 429 while sequence is pending', `got ${lastServerResponse ? lastServerResponse.code : 'none'}`);
 })();
 
-// --- REBOOT EVALUATION TEST SUITE FOR ALL STATES ---
+// Reboot state recovery
 
 // Reboot Test 1: Reboot at Fully Closed Position (0%)
 (() => {
@@ -802,7 +800,7 @@ console.log('====================================================\n');
   assert(global.previousState === STATE_UNKNOWN, 'Reboot 6.2: Reboot on fresh flash sets previousState to UNKNOWN', `got ${getDebugString(global.previousState)}`);
 })();
 
-// --- NEW TEST SUITE: EXTERNAL MANUAL OVERRIDE & EMERGENCY RELEASE ---
+// External manual override
 // Test 18: External Manual Override from CLOSED position (sensor unseats without relay pulse)
 (() => {
   resetEnvironment();
@@ -835,7 +833,7 @@ console.log('====================================================\n');
   assert(global.currentState === STATE_CLOSING, 'Test 19.1: Unseating OPEN sensor without pulse transitions to STATE_CLOSING', `got ${getDebugString(global.currentState)}`);
 })();
 
-// --- NEW TEST SUITE: MOTOR OBSTACLE AUTO-REVERSALS & MID-TRACK STALL ---
+// Obstacle auto-reversals and stall detection
 // Test 20: Auto-Reversal while CLOSING (obstruction trips motor auto-reverse back to OPEN limit switch)
 (() => {
   resetEnvironment();
@@ -872,7 +870,7 @@ console.log('====================================================\n');
   assert(lastServerResponse && lastServerResponse.code === 200, 'Test 21.6: handleToggle() executes pulse successfully (200 OK)', `got ${lastServerResponse ? lastServerResponse.code : 'none'}`);
 })();
 
-// --- NEW TEST SUITE: PULSE VERIFICATION (FAULT_FAILED_TO_MOVE) ---
+// Pulse verification (failed-to-move)
 // Test 22: Pulse verification marks failedToMove when switch fails to disengage
 (() => {
   resetEnvironment();
@@ -890,7 +888,7 @@ console.log('====================================================\n');
   assert(global.currentState === STATE_STOPPED, 'Test 22.3: Door forced to STATE_STOPPED on failed movement', `got ${getDebugString(global.currentState)}`);
 })();
 
-// --- NEW TEST SUITE: NVS FLASH WEAR MINIMIZATION ---
+// NVS flash persistence
 // Test 23: NVS writes are skipped for transient moving states
 (() => {
   resetEnvironment();
@@ -907,7 +905,7 @@ console.log('====================================================\n');
   assert(global.nvsStore.curr === STATE_OPEN, 'Test 23.2: NVS curr updated on stable resting STATE_OPEN', `got ${global.nvsStore.curr}`);
 })();
 
-// --- NEW TEST SUITE: FALLBACK DUMB BUTTON CYCLING ---
+// Fallback button cycling
 // Test 24: When limit switches fail/unresponsive (severed wires, both inactive), toggle cycles Opening -> Stopped -> Closing -> Stopped
 (() => {
   resetEnvironment();
@@ -949,7 +947,7 @@ console.log('====================================================\n');
 
 
 
-// --- NEW TEST SUITE: RAPID COMMAND FLOOD LOCKOUT ---
+// Command rate limit lockout
 // Test 25: Commands within 1.5s lockout are rejected
 (() => {
   resetEnvironment();
@@ -964,7 +962,7 @@ console.log('====================================================\n');
   assert(lastServerResponse && lastServerResponse.code === 429, 'Test 25.2: handleOn() rejects rapid flood with 429', `got ${lastServerResponse ? lastServerResponse.code : 'none'}`);
 })();
 
-// --- NEW TEST SUITE: POSITION TRACKING & FLIGHT PROGRESSION ---
+// Position tracking and flight progression
 // Test 26: calculateCurrentPosition() interpolates from relay-initiated flight start time
 (() => {
   resetEnvironment();
@@ -997,7 +995,7 @@ console.log('====================================================\n');
   assert(calculateCurrentPosition() === 42, 'Test 26.5: Stopped door returns latched currentPositionPct', `got ${calculateCurrentPosition()}`);
 })();
 
-// --- NEW TEST SUITE: PASSIVE AUTO-CALIBRATION ---
+// Passive auto-calibration
 // Test 27: Passive calibration runs on complete natural strokes
 (() => {
   resetEnvironment();
@@ -1008,7 +1006,7 @@ console.log('====================================================\n');
   global.openDurationMs = 17000;
   global.switchUnseated = true;
   global.hasIntermediateStop = false;
-  global.activeFlightStartTime = now - 17000; // 17.0s flight to switch (+1s activation compensation = 18.0s)
+  global.activeFlightStartTime = now - 16900; // 16.9s raw flight to switch (+3.1s activation compensation = 20.0s)
   global.isCalibrated = false;
 
   // Door completes flight and triggers OPEN sensor
@@ -1016,9 +1014,9 @@ console.log('====================================================\n');
   global.realClosedSensor = false;
   updateLogic();
 
-  // (17000 * 3 + 18000) / 4 = 69000 / 4 = 17250
+  // (17000 * 3 + 20000) / 4 = 71000 / 4 = 17750
   assert(global.isCalibrated === true, 'Test 27.1: Full stroke sets isCalibrated to true', `got ${global.isCalibrated}`);
-  assert(global.openDurationMs === 17250, 'Test 27.2: openDurationMs smoothed via EMA (17250ms)', `got ${global.openDurationMs}`);
+  assert(global.openDurationMs === 17750, 'Test 27.2: openDurationMs smoothed via EMA (17750ms)', `got ${global.openDurationMs}`);
   assert(global.lastCalibrationTimeOpen > 0, 'Test 27.3: lastCalibrationTimeOpen recorded', `got ${global.lastCalibrationTimeOpen}`);
 
   // 27.4: Daily Lockout: Second stroke in the same day does not recalibrate
@@ -1038,16 +1036,16 @@ console.log('====================================================\n');
   global.closeDurationMs = 17000;
   global.switchUnseated = true;
   global.hasIntermediateStop = false;
-  global.activeFlightStartTime = now - 18000; // 18.0s flight to switch (+1s activation compensation = 19.0s)
+  global.activeFlightStartTime = now - 16100; // 16.1s raw flight to switch (+0.9s activation compensation = 17.0s)
   global.realOpenSensor = false;
   global.realClosedSensor = true; // hits closed switch
   updateLogic();
-  // (17000 * 3 + 19000) / 4 = 70000 / 4 = 17500
-  assert(global.closeDurationMs === 17500, 'Test 27.5: Closing stroke independently calibrates closeDurationMs', `got ${global.closeDurationMs}`);
+  // (17000 * 3 + 17000) / 4 = 68000 / 4 = 17000
+  assert(global.closeDurationMs === 17000, 'Test 27.5: Closing stroke independently calibrates closeDurationMs', `got ${global.closeDurationMs}`);
   delete global.simulatedMillis;
 })();
 
-// --- NEW TEST SUITE: OUTLIER & MANUAL PAUSE REJECTION ---
+// Outlier and intermediate stop rejection
 // Test 28: Rejects flights outside plausible window (<15s, >25s) or deviation > 3.5s
 (() => {
   resetEnvironment();
@@ -1055,12 +1053,12 @@ console.log('====================================================\n');
   global.isCalibrated = true;
   global.lastCalibrationTimeOpen = 0; // ready for daily calibration
 
-  // 28.1: Too short (< 15.0s, e.g. 13.0s raw + 1.0s = 14.0s)
+  // 28.1: Too short (< 15.0s, e.g. 11.0s raw + 3.1s = 14.1s)
   global.currentState = STATE_OPENING;
   global.previousState = STATE_CLOSED;
   global.switchUnseated = true;
   global.hasIntermediateStop = false;
-  global.activeFlightStartTime = millis() - 13000;
+  global.activeFlightStartTime = millis() - 11000;
   global.realOpenSensor = true;
   updateLogic();
   assert(global.openDurationMs === 17000, 'Test 28.1: Flight < 15s discarded from calibration', `got ${global.openDurationMs}`);
@@ -1107,7 +1105,7 @@ console.log('====================================================\n');
   assert(global.openDurationMs === 17000, 'Test 28.4: Stroke with intermediate stop discarded', `got ${global.openDurationMs}`);
 })();
 
-// --- NEW TEST SUITE: NVS WEAR PROTECTION & COOLDOWN ---
+// NVS wear protection and cooldown
 // Test 29: NVS Flash commits only when resting at CLOSED, delta >= 200ms, and cooldown respected
 (() => {
   resetEnvironment();
@@ -1138,7 +1136,7 @@ console.log('====================================================\n');
   assert(global.nvsStore["stop_pos"] === 65, 'Test 29.5: STATE_STOPPED writes stop_pos to NVS', `got ${global.nvsStore["stop_pos"]}`);
 })();
 
-// --- NEW TEST SUITE: CALIBRATE RESET ENDPOINT ---
+// Calibration reset endpoint
 // Test 30: handleCalibrateReset() resets durations and clears calibration flag safely
 (() => {
   resetEnvironment();
