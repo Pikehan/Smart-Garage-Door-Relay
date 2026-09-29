@@ -11,7 +11,7 @@ This controller interfaces with a standard cyclic garage door opener and two mag
 - **Single-Button Pulse Actuation**: The opener motor operates via a single wall-button circuit that cycles: **Open → Stop → Close → Stop**. The ESP32 pulses an active-LOW relay for 200ms across these terminals to simulate a physical push-button press.
 - **Directional Control**: When commanded to open (`/on`) or close (`/off`) while traveling in the opposite direction, the controller executes a safety sequence: it pulses once immediately to stop the door, waits 500ms, and pulses a second time to reverse direction toward your intended target.
 - **Limit Switches**: Two magnetic reed switches detect when the door reaches the physical **Closed** (bottom) or **Open** (overhead) positions. Sensor triggers always take priority—if the door is moved manually or via an external remote, the ESP32 automatically updates its state upon switch contact.
-- **Safety Timeout**: If the motor travels for more than 22 seconds without reaching a limit switch, the controller marks the door as `STOPPED` and flags a stall warning.
+- **Safety Timeout**: If the motor travels for more than 27 seconds without reaching a limit switch, the controller marks the door as `STOPPED` and flags a stall warning.
 
 ---
 
@@ -25,7 +25,7 @@ The controller tracks six discrete states:
 | **`OPEN`** | Door is fully raised overhead. | Open sensor active, Closed sensor inactive. |
 | **`OPENING`** | Motor is running upward toward the open limit switch. | Both sensors inactive. |
 | **`CLOSING`** | Motor is running downward toward the closed limit switch. | Both sensors inactive. |
-| **`STOPPED`** | Door was halted midway by a toggle button, safety stall, or 22s travel timeout. | Both sensors inactive (previous direction remembered in NVS). |
+| **`STOPPED`** | Door was halted midway by a toggle button, safety stall, or 27s travel timeout. | Both sensors inactive (previous direction remembered in NVS). |
 | **`UNKNOWN`** | Initial startup state before sensor readings and flash memory are verified. | Checked immediately upon boot. |
 
 ---
@@ -64,11 +64,14 @@ Navigate to `http://garage-door.local` in any browser to access the control inte
 | Endpoint | Method | Description |
 | :--- | :---: | :--- |
 | `/` | `GET` | Interactive web dashboard and status telemetry. |
-| `/state` | `GET` | Returns JSON status, limit switch states, and fault flags. |
+| `/state` | `GET` | Returns JSON status, limit switch states, calibration, and fault flags. |
 | `/toggle` | `POST` | Simulates a wall push-button press (opens if closed, closes if open, stops if moving). |
 | `/on` | `POST` | Commands the door to OPEN (ignored if already open or opening). |
 | `/off` | `POST` | Commands the door to CLOSE (ignored if already closed or closing). |
+| `/calibrate/reset` | `POST` | Resets learned door travel duration calibration back to factory defaults. |
 | `/reboot` | `POST` | Gracefully reboots the ESP32 controller. |
+| `/setup` | `GET`, `POST` | Wi-Fi provisioning configuration portal. |
+| `/update` | `GET`, `POST` | Over-the-air firmware update interface and binary upload handler. |
 
 ### Example Payloads
 
@@ -98,7 +101,12 @@ curl -X POST http://garage-door.local/toggle
   "failed_to_move": false,
   "mid_track_stall": false,
   "last_commanded_direction": "OPENING",
-  "uptime_seconds": 1420
+  "uptime_seconds": 1420,
+  "position_pct": 0,
+  "open_duration_ms": 17000,
+  "close_duration_ms": 17000,
+  "is_calibrated": false,
+  "switch_unseated": false
 }
 ```
 
@@ -155,6 +163,8 @@ sensor:
       - sensor_timeout_error
       - failed_to_move
       - mid_track_stall
+      - position_pct
+      - switch_unseated
 ```
 
 ---
